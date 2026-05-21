@@ -887,14 +887,26 @@ function ChartView({ sheet, onChangeType }: ChartViewProps) {
   );
 }
 
+// ─── HMR state preservation ───────────────────────────────────────────────────
+// При горячей замене модуля (HMR) React-состояние сбрасывается.
+// Сохраняем файлы и чат в window чтобы восстановить после перезагрузки модуля.
+
+declare global {
+  interface Window {
+    __datamind_files?: ExcelFile[];
+    __datamind_activeFileId?: string | null;
+    __datamind_messages?: ChatMessage[];
+  }
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function Index() {
-  const [files, setFiles] = useState<ExcelFile[]>([]);
-  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [files, setFiles] = useState<ExcelFile[]>(() => window.__datamind_files ?? []);
+  const [activeFileId, setActiveFileId] = useState<string | null>(() => window.__datamind_activeFileId ?? null);
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
   const [selected, setSelected] = useState<{ row: number; col: number } | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([{
+  const [messages, setMessages] = useState<ChatMessage[]>(() => window.__datamind_messages ?? [{
     role: "ai",
     text: "Загрузи один или несколько Excel-файлов. Я вижу все их содержимое и могу выполнять задания — считать, трансформировать, создавать новые листы.\n\nМожно прикрепить **скриншот графика** — я пойму как его воспроизвести на твоих данных.",
     ts: getTime(),
@@ -906,6 +918,11 @@ export default function Index() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [aiSettings, setAiSettings] = useState<AiSettings>(loadSettings);
   const [, setAiError] = useState<string | null>(null);
+
+  // Сохраняем в window при каждом изменении
+  useEffect(() => { window.__datamind_files = files; }, [files]);
+  useEffect(() => { window.__datamind_activeFileId = activeFileId; }, [activeFileId]);
+  useEffect(() => { window.__datamind_messages = messages; }, [messages]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -1066,10 +1083,20 @@ export default function Index() {
             if (!ws) return;
             changes.forEach(({ row, col, bgColor, fontColor, bold }) => {
               const addr = XLSX.utils.encode_cell({ r: row, c: col });
-              const cell = ws[addr] as XLSX.CellObject | undefined;
-              if (!cell) return;
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const s: Record<string, any> = { ...((cell as any).s ?? {}) };
+              let cell = ws[addr] as any;
+              if (!cell) {
+                // Создаём пустую ячейку если её нет — чтобы покрасить даже пустые
+                cell = { t: "z", v: null };
+                ws[addr] = cell;
+                // Расширяем !ref если нужно
+                const ref = XLSX.utils.decode_range(ws["!ref"] || "A1");
+                if (row > ref.e.r) ref.e.r = row;
+                if (col > ref.e.c) ref.e.c = col;
+                ws["!ref"] = XLSX.utils.encode_range(ref);
+              }
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const s: Record<string, any> = { ...(cell.s ?? {}) };
               if (bgColor) {
                 s.fgColor = { argb: bgColor };
                 s.patType = "solid";
@@ -1081,7 +1108,7 @@ export default function Index() {
               if (bold !== undefined) {
                 s.font = { ...(s.font ?? {}), bold };
               }
-              (cell as XLSX.CellObject & { s: unknown }).s = s;
+              cell.s = s;
             });
           });
 
@@ -1091,7 +1118,8 @@ export default function Index() {
             if (!sm2) return sh;
             const cells = sh.cells.map(row => [...row]);
             sm2.changes.forEach(({ row, col, bgColor, fontColor, bold }) => {
-              if (!cells[row]?.[col]) return;
+              if (!cells[row]) return;
+              if (!cells[row][col]) cells[row][col] = { v: null };
               const prev = cells[row][col];
               const newStyle: CellStyle = { ...(prev.s ?? {}) };
               if (bgColor) newStyle.bgColor = `#${bgColor.slice(2)}`;
