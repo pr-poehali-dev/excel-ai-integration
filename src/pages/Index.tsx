@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import * as XLSX from "xlsx";
+import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import Icon from "@/components/ui/icon";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -27,6 +28,8 @@ interface ChatMessage {
   text: string;
   ts: string;
   refs?: string[];
+  chartData?: { name: string; value: number }[];
+  chartTitle?: string;
 }
 
 
@@ -538,30 +541,52 @@ export default function Index() {
     setAiError(null);
     try {
       const result = await callAi(text, files, aiSettings);
+
+      // Собираем chart данные из первой мутации если есть 2 колонки (метка + число)
+      let chartData: { name: string; value: number }[] | undefined;
+      let chartTitle: string | undefined;
       if (result.mutations && result.mutations.length > 0) {
-        const firstMutation = result.mutations[0];
-        // Применяем все листы и сразу переключаем активный файл + лист
-        result.mutations.forEach(({ fileId, sheetName, data }) => {
-          const ROWS = Math.max(data.length + 10, 50);
-          const COLS = Math.max(...data.map((r) => r.length), 20);
-          const padded: CellValue[][] = Array.from({ length: ROWS }, (_, r) =>
-            Array.from({ length: COLS }, (_, c) => data[r]?.[c] ?? null)
-          );
-          setFiles((prev) => prev.map((f) => {
-            if (f.id !== fileId) return f;
-            const existing = f.sheets.findIndex((s) => s.name === sheetName);
-            let sheets = [...f.sheets];
-            if (existing >= 0) {
-              sheets[existing] = { name: sheetName, data: padded, colWidths: Array(COLS).fill(100) };
-            } else {
-              sheets = [...sheets, { name: sheetName, data: padded, colWidths: Array(COLS).fill(100) }];
-            }
-            return { ...f, sheets, activeSheet: sheets.length - 1, isDirty: true };
-          }));
+        const firstMut = result.mutations[0];
+        const rows = firstMut.data;
+        const dataRows = rows.slice(1).filter(r => r[0] != null && r[1] != null);
+        if (dataRows.length > 0 && dataRows.every(r => !isNaN(Number(r[1])))) {
+          chartData = dataRows.map(r => ({ name: String(r[0]), value: Number(r[1]) }));
+          chartTitle = firstMut.sheetName;
+        }
+
+        // Применяем все мутации одним setFiles
+        setFiles((prev) => {
+          let next = [...prev];
+          result.mutations!.forEach(({ fileId, sheetName, data }) => {
+            const COLS = Math.max(...data.map((r) => r.length), 2);
+            const ROWS = Math.max(data.length + 10, 50);
+            const padded: CellValue[][] = Array.from({ length: ROWS }, (_, r) =>
+              Array.from({ length: COLS }, (_, c) => data[r]?.[c] ?? null)
+            );
+            next = next.map((f) => {
+              if (f.id !== fileId) return f;
+              const existing = f.sheets.findIndex((s) => s.name === sheetName);
+              let sheets = [...f.sheets];
+              if (existing >= 0) {
+                sheets[existing] = { name: sheetName, data: padded, colWidths: Array(COLS).fill(120) };
+              } else {
+                sheets = [...sheets, { name: sheetName, data: padded, colWidths: Array(COLS).fill(120) }];
+              }
+              return { ...f, sheets, activeSheet: sheets.length - 1, isDirty: true };
+            });
+          });
+          return next;
         });
-        setActiveFileId(firstMutation.fileId);
+        setActiveFileId(firstMut.fileId);
       }
-      setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime() }]);
+
+      setMessages((prev) => [...prev, {
+        role: "ai",
+        text: result.text,
+        ts: getTime(),
+        chartData,
+        chartTitle,
+      }]);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Неизвестная ошибка";
       setAiError(msg);
@@ -948,6 +973,42 @@ export default function Index() {
                     style={msg.role === "ai" ? { background: "rgba(255,255,255,0.03)" } : {}}
                   >
                     <p dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }} />
+                    {msg.chartData && msg.chartData.length > 0 && (
+                      <div className="mt-3 -mx-1">
+                        {msg.chartTitle && (
+                          <p className="text-[10px] text-muted-foreground mb-1 font-medium">{msg.chartTitle}</p>
+                        )}
+                        <ResponsiveContainer width="100%" height={200}>
+                          <PieChart>
+                            <Pie
+                              data={msg.chartData}
+                              cx="50%"
+                              cy="50%"
+                              innerRadius={40}
+                              outerRadius={75}
+                              paddingAngle={3}
+                              dataKey="value"
+                            >
+                              {msg.chartData.map((_, ci) => (
+                                <Cell key={ci} fill={[
+                                  "hsl(158,64%,52%)", "hsl(43,96%,58%)", "hsl(213,100%,65%)",
+                                  "hsl(280,65%,65%)", "hsl(10,80%,60%)", "hsl(170,60%,50%)"
+                                ][ci % 6]} />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              contentStyle={{ background: "hsl(220,14%,10%)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 11 }}
+                              labelStyle={{ color: "hsl(210,20%,90%)" }}
+                            />
+                            <Legend
+                              wrapperStyle={{ fontSize: 10, color: "hsl(215,14%,55%)" }}
+                              iconType="circle"
+                              iconSize={8}
+                            />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
                     <p className={`text-[10px] mt-1 ${msg.role === "ai" ? "text-muted-foreground" : "opacity-50"}`}>{msg.ts}</p>
                   </div>
                 </div>
