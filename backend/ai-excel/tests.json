@@ -1,0 +1,22 @@
+{
+  "tests": [
+    {
+      "name": "Проверка CORS preflight",
+      "method": "OPTIONS",
+      "path": "/",
+      "expectedStatus": 200
+    },
+    {
+      "name": "Аналитический запрос без файлов",
+      "method": "POST",
+      "path": "/",
+      "body": {
+        "prompt": "привет",
+        "files_context": []
+      },
+      "expectedStatus": 400,
+      "expectedBody": { "error": "string" },
+      "bodyMatcher": "partial"
+    }
+  ]
+}
