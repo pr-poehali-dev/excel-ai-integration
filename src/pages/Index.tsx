@@ -288,17 +288,28 @@ function buildWorkbook(file: ExcelFile): XLSX.WorkBook {
   return wb;
 }
 
-function sheetToText(sh: SheetData): string {
-  // Передаём строки с реальными данными + номер строки (0-based row index) для точного позиционирования ИИ
-  const result: string[] = [];
+// Полный текст листа с номерами строк (для активного листа)
+function sheetToText(sh: SheetData, full = false): string {
+  const MAX_ROWS = full ? 300 : 5;
+  const MAX_COLS = 20; // не более 20 колонок
+  const MAX_CELL_LEN = 30; // обрезаем длинные значения
+
+  const dataRows: string[] = [];
   sh.cells.forEach((row, ri) => {
     if (!row.some(c => c.v !== null)) return;
-    const vals = row.map(c => c.w ?? (c.v !== null ? String(c.v) : "")).join("\t");
-    result.push(`${ri}\t${vals}`);
+    const vals = row.slice(0, MAX_COLS).map(c => {
+      const s = c.w ?? (c.v !== null ? String(c.v) : "");
+      return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…" : s;
+    }).join("\t");
+    dataRows.push(`${ri}\t${vals}`);
   });
-  // Максимум 200 строк чтобы не превышать контекст
-  return ["ROW\t" + Array.from({ length: sh.cells[0]?.length ?? 0 }, (_, i) => String.fromCharCode(65 + i)).join("\t"),
-    ...result.slice(0, 200)].join("\n");
+
+  const totalDataRows = dataRows.length;
+  const sliced = dataRows.slice(0, MAX_ROWS);
+
+  const header = "ROW\t" + Array.from({ length: Math.min(sh.cells[0]?.length ?? 0, MAX_COLS) }, (_, i) => colLetter(i)).join("\t");
+  const suffix = !full && totalDataRows > MAX_ROWS ? `\n[...ещё ${totalDataRows - MAX_ROWS} строк не показано]` : "";
+  return [header, ...sliced].join("\n") + suffix;
 }
 
 // ─── AI Settings ─────────────────────────────────────────────────────────────
@@ -494,7 +505,15 @@ async function callAi(
   const filesContext = files.map((f) => ({
     name: f.name,
     role: f.role,
-    sheets: f.sheets.map((sh) => ({ name: sh.name, preview: sheetToText(sh) })),
+    sheets: f.sheets.map((sh, si) => {
+      const isActive = si === f.activeSheet;
+      return {
+        name: sh.name,
+        active: isActive,
+        total_rows: sh.cells.filter(r => r.some(c => c.v !== null)).length,
+        preview: sheetToText(sh, isActive), // активный — полный, остальные — только шапка
+      };
+    }),
   }));
 
   const imagesB64 = images.map(img => ({

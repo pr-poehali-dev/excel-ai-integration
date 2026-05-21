@@ -127,7 +127,10 @@ def handler(event: dict, context) -> dict:
 
         context_parts.append(f"=== Файл {i} «{fc['name']}»{role_label} ===")
         for sheet in fc.get("sheets", []):
-            context_parts.append(f"--- Лист «{sheet['name']}» ---")
+            is_active = sheet.get("active", False)
+            total = sheet.get("total_rows", "?")
+            marker = " [АКТИВНЫЙ ЛИСТ — полные данные]" if is_active else f" [краткий просмотр, всего {total} строк]"
+            context_parts.append(f"--- Лист «{sheet['name']}»{marker} ---")
             context_parts.append(sheet.get("preview", ""))
 
     text_block = f"ДАННЫЕ ФАЙЛОВ:\n{chr(10).join(context_parts)}\n\nЗАДАНИЕ: {prompt or '(см. изображения)'}\n\nОтветь ТОЛЬКО JSON."
@@ -152,7 +155,7 @@ def handler(event: dict, context) -> dict:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=4000,
+            max_tokens=2000,
             temperature=0.1,
         )
     except Exception as e:
