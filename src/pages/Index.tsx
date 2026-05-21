@@ -98,6 +98,7 @@ function fileToContext(file: ExcelFile): string {
 // ─── AI Settings ─────────────────────────────────────────────────────────────
 
 const BACKEND_URL = "https://functions.poehali.dev/0ca54b20-aea0-424c-8e74-fa9b445c95ba";
+const CHART_URL = "https://functions.poehali.dev/8376b365-14fc-4551-9fc7-0798d13ac4e6";
 
 const PRESET_PROVIDERS = [
   { label: "RouterAI (рекомендуется)", baseUrl: "https://routerai.ru/api/v1" },
@@ -324,6 +325,46 @@ function SettingsModal({ settings, onChange, onClose }: SettingsModalProps) {
       </div>
     </div>
   );
+}
+
+// ─── Excel chart builder ─────────────────────────────────────────────────────
+
+async function buildChartXlsx(
+  file: ExcelFile,
+  chartSheetName: string,
+  chartType: string,
+  chartTitle: string
+): Promise<void> {
+  const sheetsPayload = file.sheets.map((sh) => ({
+    name: sh.name,
+    data: sh.data.filter((r) => r.some((c) => c !== null)),
+  }));
+
+  const resp = await fetch(CHART_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sheets: sheetsPayload,
+      chart_sheet: chartSheetName,
+      chart_type: chartType,
+      chart_title: chartTitle,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(`Ошибка генерации графика: ${resp.status}`);
+  const { xlsx_b64 } = await resp.json();
+
+  // Скачиваем файл
+  const binary = atob(xlsx_b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const blob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = file.name.replace(/\.(xlsx|xls|csv)$/i, "") + "_с_графиком.xlsx";
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ─── Real AI call ─────────────────────────────────────────────────────────────
@@ -578,11 +619,30 @@ export default function Index() {
           return next;
         });
         setActiveFileId(firstMut.fileId);
+
+        // Если есть данные для графика — генерируем xlsx с диаграммой и скачиваем
+        if (chartData && chartData.length > 0) {
+          // Берём актуальный файл после обновления состояния
+          const targetFile = files.find(f => f.id === firstMut.fileId);
+          if (targetFile) {
+            // Добавляем новый лист в копию файла для отправки
+            const COLS = Math.max(...firstMut.data.map(r => r.length), 2);
+            const updatedFile: ExcelFile = {
+              ...targetFile,
+              sheets: [
+                ...targetFile.sheets.filter(s => s.name !== firstMut.sheetName),
+                { name: firstMut.sheetName, data: firstMut.data, colWidths: Array(COLS).fill(120) },
+              ],
+            };
+            buildChartXlsx(updatedFile, firstMut.sheetName, "pie", chartTitle ?? firstMut.sheetName)
+              .catch(() => {/* тихо игнорируем ошибку скачивания */});
+          }
+        }
       }
 
       setMessages((prev) => [...prev, {
         role: "ai",
-        text: result.text,
+        text: result.text + (chartData ? "\n\n📥 **Файл с графиком скачивается автоматически**" : ""),
         ts: getTime(),
         chartData,
         chartTitle,
