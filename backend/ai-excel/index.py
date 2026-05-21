@@ -1,45 +1,70 @@
 """
 ИИ-аналитик для Excel: принимает контекст файлов и задание,
-возвращает текстовый ответ + (опционально) данные для нового листа.
-Поддерживает произвольный провайдер, модель и ключ из запроса.
+возвращает текстовый ответ + данные нового листа.
 """
 
 import os
 import json
+import re
 from openai import OpenAI
 
 SYSTEM_PROMPT = """Ты — профессиональный аналитик данных и эксперт по Excel.
-Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV-формат), а также задание пользователя.
+Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV), а также задание пользователя.
 
-Твоя задача:
-1. Выполнить задание, используя данные из файлов
-2. Вернуть JSON-ответ строго в следующем формате:
+КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON и НИЧЕМ КРОМЕ JSON. Никакого текста до или после. Никаких ```json``` обёрток.
 
+Формат ответа:
 {
-  "text": "Объяснение что сделано и краткий итог (на русском)",
+  "text": "Краткое объяснение что сделано (на русском, 1-3 предложения)",
   "new_sheet": {
     "file_index": 0,
     "sheet_name": "Название_листа",
-    "data": [["заголовок1","заголовок2",...],[значение1,значение2,...],...]
+    "data": [["Заголовок1","Заголовок2",...],["значение1","значение2",...],...]
   }
 }
 
-Правила:
-- new_sheet включай ТОЛЬКО если нужно создать новый лист с данными
-- file_index — индекс файла из списка (0 = первый файл), обычно основной файл
-- data — двумерный массив, первая строка — заголовки
-- В text используй ** для выделения ключевых цифр и «кавычки» для названий
-- Если задание только аналитическое (без создания листа) — new_sheet не включай
-- Максимум 500 строк в new_sheet.data
-- Отвечай ТОЛЬКО валидным JSON, без markdown-обёртки и без ```json"""
+ПРАВИЛА:
+1. Поле "text" — ОБЯЗАТЕЛЬНО всегда
+2. Поле "new_sheet" — включай ВСЕГДА когда задание подразумевает создание таблицы, расчётов, итогов, фильтрации, сортировки, графика (данные для графика), преобразования данных
+3. "new_sheet" НЕ включай только если вопрос чисто аналитический без создания данных (например "сколько строк?" или "какие колонки есть?")
+4. В "data" первая строка — заголовки, остальные — данные. Максимум 500 строк
+5. "file_index" — индекс файла (0 = первый), куда добавить лист
+6. НЕ пиши текст вне JSON. НЕ используй markdown. НЕ объясняй что ты собираешься сделать — просто сделай и верни JSON с результатом
+7. Если просят "график" — создай лист с данными для графика (две колонки: метка и значение)
+8. Все числа в data передавай как числа (не строки), текст — как строки"""
 
-# Дефолтные настройки провайдера (используются если не переданы в запросе)
 DEFAULT_BASE_URL = "https://routerai.ru/api/v1"
-DEFAULT_MODEL = "deepseek/deepseek-chat-v3-5k"
+DEFAULT_MODEL = "deepseek/deepseek-chat"
+
+
+def extract_json(raw: str) -> dict:
+    """Извлекает JSON из ответа даже если модель добавила лишний текст"""
+    raw = raw.strip()
+
+    # Убираем markdown-обёртку
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+
+    # Пробуем напрямую
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # Ищем первый JSON-объект в тексте
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except Exception:
+            pass
+
+    return {"text": raw or "ИИ вернул пустой ответ"}
 
 
 def handler(event: dict, context) -> dict:
-    """Обработка ИИ-запроса к Excel-данным с поддержкой смены провайдера/модели"""
+    """Обработка ИИ-запроса к Excel-данным"""
 
     if event.get("httpMethod") == "OPTIONS":
         return {
@@ -57,7 +82,6 @@ def handler(event: dict, context) -> dict:
     prompt = body.get("prompt", "").strip()
     files_context = body.get("files_context", [])
 
-    # Параметры провайдера — из запроса или дефолтные
     api_key = body.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
     base_url = body.get("base_url") or DEFAULT_BASE_URL
     model = body.get("model") or DEFAULT_MODEL
@@ -92,7 +116,7 @@ def handler(event: dict, context) -> dict:
             context_parts.append(f"--- Лист «{sheet['name']}» ---")
             context_parts.append(sheet.get("preview", ""))
 
-    user_message = f"ДАННЫЕ ФАЙЛОВ:\n{chr(10).join(context_parts)}\n\nЗАДАНИЕ ПОЛЬЗОВАТЕЛЯ:\n{prompt}"
+    user_message = f"ДАННЫЕ ФАЙЛОВ:\n{chr(10).join(context_parts)}\n\nЗАДАНИЕ: {prompt}\n\nОтветь ТОЛЬКО JSON."
 
     response = client.chat.completions.create(
         model=model,
@@ -100,21 +124,14 @@ def handler(event: dict, context) -> dict:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
-        max_tokens=4000,
-        temperature=0.3,
+        max_tokens=6000,
+        temperature=0.1,
     )
 
     raw = response.choices[0].message.content or "{}"
+    print(f"[AI RAW RESPONSE]: {raw[:500]}")
 
-    # Убираем возможную markdown-обёртку
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-
-    result = json.loads(raw)
+    result = extract_json(raw)
 
     return {
         "statusCode": 200,

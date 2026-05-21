@@ -7,12 +7,13 @@
       "expectedStatus": 200
     },
     {
-      "name": "Аналитический запрос без файлов",
+      "name": "Запрос без ключа возвращает ошибку",
       "method": "POST",
       "path": "/",
       "body": {
         "prompt": "привет",
-        "files_context": []
+        "files_context": [],
+        "api_key": ""
       },
       "expectedStatus": 400,
       "expectedBody": { "error": "string" },
