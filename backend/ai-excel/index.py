@@ -9,7 +9,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key=os.environ["OPENAI_API_KEY"],
-    base_url="https://api.routerai.ru/v1",
+    base_url="https://routerai.ru/api/v1",
 )
 
 SYSTEM_PROMPT = """Ты — профессиональный аналитик данных и эксперт по Excel.
