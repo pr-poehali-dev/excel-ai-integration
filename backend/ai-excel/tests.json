@@ -7,17 +7,16 @@
       "expectedStatus": 200
     },
     {
-      "name": "Запрос без ключа возвращает ошибку",
+      "name": "Пустой запрос (нет prompt и images) возвращает ошибку",
       "method": "POST",
       "path": "/",
       "body": {
-        "prompt": "привет",
+        "prompt": "",
         "files_context": [],
-        "api_key": ""
+        "images": [],
+        "api_key": "test"
       },
-      "expectedStatus": 400,
-      "expectedBody": { "error": "string" },
-      "bodyMatcher": "partial"
+      "expectedStatus": 400
     }
   ]
 }

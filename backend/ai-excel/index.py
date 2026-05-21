@@ -9,7 +9,7 @@ import re
 from openai import OpenAI
 
 SYSTEM_PROMPT = """Ты — профессиональный аналитик данных и эксперт по Excel.
-Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV), а также задание пользователя.
+Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV), задание пользователя, и (опционально) изображения — скриншоты графиков, примеры оформления.
 
 КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON и НИЧЕМ КРОМЕ JSON. Никакого текста до или после. Никаких ```json``` обёрток.
 
@@ -31,7 +31,8 @@ SYSTEM_PROMPT = """Ты — профессиональный аналитик д
 5. "file_index" — индекс файла (0 = первый), куда добавить лист
 6. НЕ пиши текст вне JSON. НЕ используй markdown. НЕ объясняй что ты собираешься сделать — просто сделай и верни JSON с результатом
 7. Если просят "график" — создай лист с данными для графика (две колонки: метка и значение)
-8. Все числа в data передавай как числа (не строки), текст — как строки"""
+8. Все числа в data передавай как числа (не строки), текст — как строки
+9. Если пользователь прикрепил изображение с графиком/таблицей — используй его как образец структуры/внешнего вида при формировании данных"""
 
 DEFAULT_BASE_URL = "https://routerai.ru/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-chat"
@@ -81,12 +82,13 @@ def handler(event: dict, context) -> dict:
     body = json.loads(event.get("body") or "{}")
     prompt = body.get("prompt", "").strip()
     files_context = body.get("files_context", [])
+    images = body.get("images", [])  # [{name, data (base64), mime}]
 
     api_key = body.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
     base_url = body.get("base_url") or DEFAULT_BASE_URL
     model = body.get("model") or DEFAULT_MODEL
 
-    if not prompt:
+    if not prompt and not images:
         return {
             "statusCode": 400,
             "headers": {"Access-Control-Allow-Origin": "*"},
@@ -116,13 +118,26 @@ def handler(event: dict, context) -> dict:
             context_parts.append(f"--- Лист «{sheet['name']}» ---")
             context_parts.append(sheet.get("preview", ""))
 
-    user_message = f"ДАННЫЕ ФАЙЛОВ:\n{chr(10).join(context_parts)}\n\nЗАДАНИЕ: {prompt}\n\nОтветь ТОЛЬКО JSON."
+    text_block = f"ДАННЫЕ ФАЙЛОВ:\n{chr(10).join(context_parts)}\n\nЗАДАНИЕ: {prompt or '(см. изображения)'}\n\nОтветь ТОЛЬКО JSON."
+
+    # Строим content: текст + изображения (vision)
+    if images:
+        user_content = [{"type": "text", "text": text_block}]
+        for img in images:
+            mime = img.get("mime", "image/png")
+            data = img.get("data", "")
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{data}"},
+            })
+    else:
+        user_content = text_block
 
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
+            {"role": "user", "content": user_content},
         ],
         max_tokens=6000,
         temperature=0.1,
