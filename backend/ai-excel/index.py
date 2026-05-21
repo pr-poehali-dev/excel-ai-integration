@@ -1,16 +1,12 @@
 """
 ИИ-аналитик для Excel: принимает контекст файлов и задание,
 возвращает текстовый ответ + (опционально) данные для нового листа.
+Поддерживает произвольный провайдер, модель и ключ из запроса.
 """
 
 import os
 import json
 from openai import OpenAI
-
-client = OpenAI(
-    api_key=os.environ["OPENAI_API_KEY"],
-    base_url="https://routerai.ru/api/v1",
-)
 
 SYSTEM_PROMPT = """Ты — профессиональный аналитик данных и эксперт по Excel.
 Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV-формат), а также задание пользователя.
@@ -35,11 +31,15 @@ SYSTEM_PROMPT = """Ты — профессиональный аналитик д
 - В text используй ** для выделения ключевых цифр и «кавычки» для названий
 - Если задание только аналитическое (без создания листа) — new_sheet не включай
 - Максимум 500 строк в new_sheet.data
-- Отвечай ТОЛЬКО JSON, без markdown-обёртки"""
+- Отвечай ТОЛЬКО валидным JSON, без markdown-обёртки и без ```json"""
+
+# Дефолтные настройки провайдера (используются если не переданы в запросе)
+DEFAULT_BASE_URL = "https://routerai.ru/api/v1"
+DEFAULT_MODEL = "deepseek/deepseek-chat-v3-5k"
 
 
 def handler(event: dict, context) -> dict:
-    """Обработка ИИ-запроса к Excel-данным"""
+    """Обработка ИИ-запроса к Excel-данным с поддержкой смены провайдера/модели"""
 
     if event.get("httpMethod") == "OPTIONS":
         return {
@@ -57,12 +57,26 @@ def handler(event: dict, context) -> dict:
     prompt = body.get("prompt", "").strip()
     files_context = body.get("files_context", [])
 
+    # Параметры провайдера — из запроса или дефолтные
+    api_key = body.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
+    base_url = body.get("base_url") or DEFAULT_BASE_URL
+    model = body.get("model") or DEFAULT_MODEL
+
     if not prompt:
         return {
             "statusCode": 400,
             "headers": {"Access-Control-Allow-Origin": "*"},
             "body": json.dumps({"error": "Пустой запрос"}, ensure_ascii=False),
         }
+
+    if not api_key:
+        return {
+            "statusCode": 400,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"error": "API ключ не указан"}, ensure_ascii=False),
+        }
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
 
     # Формируем контекст из файлов
     context_parts = []
@@ -81,17 +95,25 @@ def handler(event: dict, context) -> dict:
     user_message = f"ДАННЫЕ ФАЙЛОВ:\n{chr(10).join(context_parts)}\n\nЗАДАНИЕ ПОЛЬЗОВАТЕЛЯ:\n{prompt}"
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
         max_tokens=4000,
         temperature=0.3,
-        response_format={"type": "json_object"},
     )
 
     raw = response.choices[0].message.content or "{}"
+
+    # Убираем возможную markdown-обёртку
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+
     result = json.loads(raw)
 
     return {

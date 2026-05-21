@@ -29,12 +29,7 @@ interface ChatMessage {
   refs?: string[];
 }
 
-interface Selection {
-  fileId: string;
-  sheet: number;
-  row: number;
-  col: number;
-}
+
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -97,100 +92,239 @@ function fileToContext(file: ExcelFile): string {
     .join("\n\n");
 }
 
-// ─── Mock AI ─────────────────────────────────────────────────────────────────
+// ─── AI Settings ─────────────────────────────────────────────────────────────
 
-async function mockAiProcess(
-  prompt: string,
-  files: ExcelFile[]
-): Promise<{ text: string; mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[] }> {
-  const lower = prompt.toLowerCase();
+const BACKEND_URL = "https://functions.poehali.dev/0ca54b20-aea0-424c-8e74-fa9b445c95ba";
 
-  // Simulate a delay
-  await new Promise((r) => setTimeout(r, 1600));
+const PRESET_PROVIDERS = [
+  { label: "RouterAI (рекомендуется)", baseUrl: "https://routerai.ru/api/v1" },
+  { label: "OpenAI (прямой)", baseUrl: "https://api.openai.com/v1" },
+  { label: "ProxyAPI.ru", baseUrl: "https://api.proxyapi.ru/openai/v1" },
+  { label: "Свой endpoint", baseUrl: "" },
+];
 
-  if (files.length === 0) {
-    return { text: "Загрузи хотя бы один файл, чтобы я мог с ним работать." };
-  }
+const PRESET_MODELS = [
+  { label: "DeepSeek V3 (Chat)", value: "deepseek/deepseek-chat-v3-0324:free" },
+  { label: "DeepSeek V3 Pro", value: "deepseek/deepseek-chat-v3-5k" },
+  { label: "GPT-4o mini", value: "gpt-4o-mini" },
+  { label: "GPT-4o", value: "gpt-4o" },
+  { label: "Claude 3.5 Haiku", value: "anthropic/claude-3-5-haiku" },
+  { label: "Gemini 2.0 Flash", value: "google/gemini-2.0-flash-001" },
+  { label: "Своя модель", value: "__custom__" },
+];
 
-  const mainFile = files.find((f) => f.role === "main") ?? files[0];
-  const refFile = files.find((f) => f.role === "reference");
+interface AiSettings {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  customModel: string;
+}
 
-  // Aggregate / sum command
-  if (lower.includes("сумм") || lower.includes("итог") || lower.includes("итого")) {
-    const sh = mainFile.sheets[mainFile.activeSheet];
-    const header = sh.data[0];
-    const numericCols: number[] = [];
-    header?.forEach((h, i) => {
-      if (typeof h === "string" && (h.toLowerCase().includes("сумм") || h.toLowerCase().includes("цен") || h.toLowerCase().includes("кол"))) {
-        numericCols.push(i);
-      }
-    });
-    if (numericCols.length === 0) numericCols.push(...[...Array(header?.length ?? 3).keys()].slice(1, 4));
-
-    const newSheet: CellValue[][] = [["Столбец", "Сумма", "Среднее", "Кол-во строк"]];
-    numericCols.forEach((ci) => {
-      const vals = sh.data
-        .slice(1)
-        .map((r) => Number(r[ci]))
-        .filter((v) => !isNaN(v) && v !== 0);
-      const sum = vals.reduce((a, b) => a + b, 0);
-      newSheet.push([header?.[ci] ?? `Столбец ${ci + 1}`, Math.round(sum * 100) / 100, vals.length ? Math.round((sum / vals.length) * 100) / 100 : 0, vals.length]);
-    });
-
-    return {
-      text: `Выполнено! Создан новый лист «Итоги_ИИ» в файле «${mainFile.name}» с агрегированными суммами по числовым столбцам (${numericCols.length} шт.). Данные из ${sh.data.length - 1} строк.`,
-      mutations: [{ fileId: mainFile.id, sheetName: "Итоги_ИИ", data: newSheet }],
-    };
-  }
-
-  // Copy + transform from ref to main
-  if ((lower.includes("образец") || lower.includes("формат") || lower.includes("шаблон")) && refFile) {
-    const refSh = refFile.sheets[0];
-    const mainSh = mainFile.sheets[mainFile.activeSheet];
-    const newRows: CellValue[][] = [refSh.data[0] ?? mainSh.data[0]];
-    mainSh.data.slice(1).forEach((row) => newRows.push([...row]));
-    return {
-      text: `Готово! Создал лист «Результат_ИИ» в «${mainFile.name}» — применил заголовки из образца «${refFile.name}» и заполнил данными из основного файла.`,
-      mutations: [{ fileId: mainFile.id, sheetName: "Результат_ИИ", data: newRows }],
-    };
-  }
-
-  // Deduplicate
-  if (lower.includes("дубл") || lower.includes("уникальн")) {
-    const sh = mainFile.sheets[mainFile.activeSheet];
-    const seen = new Set<string>();
-    const unique = sh.data.filter((row) => {
-      const key = JSON.stringify(row);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    return {
-      text: `Удалено дублей: ${sh.data.length - unique.length}. Уникальных строк: ${unique.length}. Результат записан на лист «Без_дублей».`,
-      mutations: [{ fileId: mainFile.id, sheetName: "Без_дублей", data: unique }],
-    };
-  }
-
-  // Sort
-  if (lower.includes("сортир") || lower.includes("упоряд")) {
-    const sh = mainFile.sheets[mainFile.activeSheet];
-    const header = sh.data[0] ?? [];
-    const rows = [...sh.data.slice(1)].sort((a, b) => {
-      const va = a[1] ?? "";
-      const vb = b[1] ?? "";
-      return String(va).localeCompare(String(vb), "ru");
-    });
-    return {
-      text: `Данные отсортированы по второму столбцу. Результат — лист «Сортировка».`,
-      mutations: [{ fileId: mainFile.id, sheetName: "Сортировка", data: [header, ...rows] }],
-    };
-  }
-
-  // Generic with context
-  const ctx = files.map((f) => `«${f.name}» (${f.sheets.length} лист(ов), ${f.sheets[0]?.data?.length ?? 0} строк)`).join(", ");
+function loadSettings(): AiSettings {
+  try {
+    const s = localStorage.getItem("datamind_ai_settings");
+    if (s) return JSON.parse(s);
+  } catch (e) { void e; }
   return {
-    text: `Вижу ${files.length} загруженных файл(а): ${ctx}.\n\nЯ могу:\n• **Посчитать итоги/суммы** → «посчитай суммы»\n• **Убрать дубли** → «удали дубликаты»\n• **Сортировать** → «отсортируй данные»\n• **Применить формат из образца** → «возьми формат из файла 2»\n\nНапиши конкретное задание!`,
+    apiKey: "",
+    baseUrl: "https://routerai.ru/api/v1",
+    model: "deepseek/deepseek-chat-v3-0324:free",
+    customModel: "",
   };
+}
+
+function saveSettings(s: AiSettings) {
+  localStorage.setItem("datamind_ai_settings", JSON.stringify(s));
+}
+
+// ─── Settings Modal ───────────────────────────────────────────────────────────
+
+interface SettingsModalProps {
+  settings: AiSettings;
+  onChange: (s: AiSettings) => void;
+  onClose: () => void;
+}
+
+function SettingsModal({ settings, onChange, onClose }: SettingsModalProps) {
+  const [local, setLocal] = useState<AiSettings>(settings);
+  const [showKey, setShowKey] = useState(false);
+
+  const update = (patch: Partial<AiSettings>) => setLocal((prev) => ({ ...prev, ...patch }));
+
+  const handleSave = () => {
+    saveSettings(local);
+    onChange(local);
+    onClose();
+  };
+
+  const effectiveModel = local.model === "__custom__" ? local.customModel : local.model;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.7)" }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="w-full max-w-md rounded-2xl border border-border/60 p-6 animate-scale-in"
+        style={{ background: "hsl(220,14%,9%)" }}>
+        <div className="flex items-center justify-between mb-5">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-lg bg-secondary flex items-center justify-center">
+              <Icon name="Settings2" size={14} className="text-primary" />
+            </div>
+            <span className="font-semibold text-foreground">Настройки ИИ</span>
+          </div>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors">
+            <Icon name="X" size={16} />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          {/* Provider */}
+          <div>
+            <label className="text-xs text-muted-foreground mb-1.5 block font-medium">Провайдер</label>
+            <div className="grid grid-cols-2 gap-1.5">
+              {PRESET_PROVIDERS.map((p) => (
+                <button
+                  key={p.label}
+                  onClick={() => { if (p.baseUrl) update({ baseUrl: p.baseUrl }); }}
+                  className={`px-3 py-2 rounded-lg text-xs text-left transition-all border ${
+                    local.baseUrl === p.baseUrl && p.baseUrl
+                      ? "border-primary/50 bg-primary/10 text-primary"
+                      : "border-border/40 text-muted-foreground hover:text-foreground hover:border-border"
+                  }`}
+                  style={{ background: local.baseUrl === p.baseUrl && p.baseUrl ? undefined : "rgba(255,255,255,0.02)" }}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <input
+              value={local.baseUrl}
+              onChange={(e) => update({ baseUrl: e.target.value })}
+              placeholder="https://your-provider.com/v1"
+              className="mt-2 w-full px-3 py-2 rounded-lg border border-border/50 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 transition-all font-mono"
+              style={{ background: "rgba(255,255,255,0.03)" }}
+            />
+          </div>
+
+          {/* API Key */}
+          <div>
+            <label className="text-xs text-muted-foreground mb-1.5 block font-medium">API ключ</label>
+            <div className="relative">
+              <input
+                type={showKey ? "text" : "password"}
+                value={local.apiKey}
+                onChange={(e) => update({ apiKey: e.target.value })}
+                placeholder="sk-..."
+                className="w-full px-3 py-2 pr-9 rounded-lg border border-border/50 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 transition-all font-mono"
+                style={{ background: "rgba(255,255,255,0.03)" }}
+              />
+              <button onClick={() => setShowKey((p) => !p)}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
+                <Icon name={showKey ? "EyeOff" : "Eye"} size={13} />
+              </button>
+            </div>
+          </div>
+
+          {/* Model */}
+          <div>
+            <label className="text-xs text-muted-foreground mb-1.5 block font-medium">Модель</label>
+            <div className="grid grid-cols-2 gap-1.5 mb-2">
+              {PRESET_MODELS.filter(m => m.value !== "__custom__").map((m) => (
+                <button
+                  key={m.value}
+                  onClick={() => update({ model: m.value })}
+                  className={`px-3 py-2 rounded-lg text-xs text-left transition-all border ${
+                    local.model === m.value
+                      ? "border-primary/50 bg-primary/10 text-primary"
+                      : "border-border/40 text-muted-foreground hover:text-foreground hover:border-border"
+                  }`}
+                  style={{ background: local.model === m.value ? undefined : "rgba(255,255,255,0.02)" }}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            <input
+              value={local.model === "__custom__" ? local.customModel : (PRESET_MODELS.find(m => m.value === local.model) ? "" : local.model)}
+              onChange={(e) => update({ model: e.target.value, customModel: e.target.value })}
+              placeholder="Или введи свою модель: deepseek/..."
+              className="w-full px-3 py-2 rounded-lg border border-border/50 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 transition-all font-mono"
+              style={{ background: "rgba(255,255,255,0.03)" }}
+            />
+          </div>
+
+          {/* Summary */}
+          <div className="p-3 rounded-lg border border-border/30 text-[11px] font-mono text-muted-foreground"
+            style={{ background: "rgba(255,255,255,0.01)" }}>
+            <span className="text-primary">{local.baseUrl || "—"}</span><br/>
+            <span className="text-amber-400">{effectiveModel || "—"}</span>
+          </div>
+        </div>
+
+        <div className="flex gap-2 mt-5">
+          <button onClick={onClose}
+            className="flex-1 px-4 py-2.5 rounded-xl text-sm text-muted-foreground border border-border/50 hover:text-foreground transition-all"
+            style={{ background: "rgba(255,255,255,0.02)" }}>
+            Отмена
+          </button>
+          <button onClick={handleSave}
+            className="flex-1 px-4 py-2.5 rounded-xl text-sm font-semibold btn-primary">
+            Сохранить
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Real AI call ─────────────────────────────────────────────────────────────
+
+async function callAi(
+  prompt: string,
+  files: ExcelFile[],
+  settings: AiSettings
+): Promise<{ text: string; mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[] }> {
+  const effectiveModel = settings.model === "__custom__" ? settings.customModel : settings.model;
+
+  const filesContext = files.map((f) => ({
+    name: f.name,
+    role: f.role,
+    sheets: f.sheets.map((sh) => {
+      const rows = sh.data.filter((r) => r.some((c) => c !== null));
+      const preview = rows.slice(0, 60).map((r) => r.map(c => c ?? "").join("\t")).join("\n");
+      return { name: sh.name, preview };
+    }),
+  }));
+
+  const resp = await fetch(BACKEND_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt,
+      files_context: filesContext,
+      api_key: settings.apiKey,
+      base_url: settings.baseUrl,
+      model: effectiveModel,
+    }),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error || `Ошибка ${resp.status}`);
+  }
+
+  const result = await resp.json();
+
+  // Конвертируем new_sheet в mutations
+  const mutations: { fileId: string; sheetName: string; data: CellValue[][] }[] = [];
+  if (result.new_sheet) {
+    const ns = result.new_sheet;
+    const targetFile = files[ns.file_index ?? 0] ?? files[0];
+    if (targetFile) {
+      mutations.push({ fileId: targetFile.id, sheetName: ns.sheet_name, data: ns.data });
+    }
+  }
+
+  return { text: result.text || "Готово!", mutations: mutations.length ? mutations : undefined };
 }
 
 // ─── Cell Editor ──────────────────────────────────────────────────────────────
@@ -240,6 +374,9 @@ export default function Index() {
   const [aiInput, setAiInput] = useState("");
   const [aiThinking, setAiThinking] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [aiSettings, setAiSettings] = useState<AiSettings>(loadSettings);
+  const [, setAiError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const tableRef = useRef<HTMLDivElement>(null);
@@ -344,16 +481,25 @@ export default function Index() {
   const handleAiSend = async () => {
     const text = aiInput.trim();
     if (!text || aiThinking) return;
+    if (!aiSettings.apiKey) {
+      setSettingsOpen(true);
+      return;
+    }
     setMessages((prev) => [...prev, { role: "user", text, ts: getTime() }]);
     setAiInput("");
     setAiThinking(true);
+    setAiError(null);
     try {
-      const result = await mockAiProcess(text, files);
+      const result = await callAi(text, files, aiSettings);
       if (result.mutations) {
         result.mutations.forEach((m) => addSheet(m.fileId, m.sheetName, m.data));
         setActiveFileId(result.mutations[0].fileId);
       }
       setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime() }]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Неизвестная ошибка";
+      setAiError(msg);
+      setMessages((prev) => [...prev, { role: "ai", text: `⚠️ Ошибка: ${msg}`, ts: getTime() }]);
     } finally {
       setAiThinking(false);
       setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 80);
@@ -402,8 +548,19 @@ export default function Index() {
   const visibleRows = activeSheet ? Math.min(activeSheet.data.length, VISIBLE_ROWS) : 0;
   const visibleCols = activeSheet ? Math.min(activeSheet.data[0]?.length ?? 0, VISIBLE_COLS) : 0;
 
+  const effectiveModelLabel = PRESET_MODELS.find(m => m.value === aiSettings.model)?.label ?? aiSettings.model;
+
   return (
     <div className="h-screen flex flex-col overflow-hidden">
+      {/* ── Settings Modal ── */}
+      {settingsOpen && (
+        <SettingsModal
+          settings={aiSettings}
+          onChange={setAiSettings}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+
       {/* ── Header ── */}
       <header className="border-b border-border/60 px-4 py-3 flex items-center gap-3 flex-shrink-0"
         style={{ background: "hsla(220,16%,6%,0.97)" }}>
@@ -476,6 +633,20 @@ export default function Index() {
               </button>
             </>
           )}
+          <button
+            onClick={() => setSettingsOpen(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all ${
+              aiSettings.apiKey
+                ? "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                : "text-amber-400 border border-amber-400/30 hover:bg-amber-400/10"
+            }`}
+            title="Настройки ИИ"
+          >
+            <Icon name="Settings2" size={14} />
+            <span className="hidden lg:inline max-w-[100px] truncate">
+              {aiSettings.apiKey ? effectiveModelLabel : "Нет ключа"}
+            </span>
+          </button>
           <button
             onClick={() => setSidebarOpen((p) => !p)}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all"
@@ -656,11 +827,27 @@ export default function Index() {
               <div className="flex-1 min-w-0">
                 <p className="text-xs font-semibold text-foreground">ИИ-аналитик</p>
                 <p className="text-[11px] text-muted-foreground truncate">
-                  {files.length === 0 ? "Нет файлов" : `${files.length} файл(а) загружено`}
+                  {aiSettings.apiKey ? effectiveModelLabel : "⚠ Ключ не настроен"}
                 </p>
               </div>
-              {aiThinking && <Icon name="Loader2" size={14} className="text-primary spinner flex-shrink-0" />}
+              {aiThinking
+                ? <Icon name="Loader2" size={14} className="text-primary spinner flex-shrink-0" />
+                : <button onClick={() => setSettingsOpen(true)} className="text-muted-foreground hover:text-foreground transition-colors flex-shrink-0">
+                    <Icon name="Settings2" size={14} />
+                  </button>
+              }
             </div>
+
+            {/* No key warning */}
+            {!aiSettings.apiKey && (
+              <button
+                onClick={() => setSettingsOpen(true)}
+                className="mx-3 mt-2 p-2.5 rounded-lg border border-amber-400/30 text-left text-[11px] text-amber-400 hover:bg-amber-400/5 transition-all animate-fade-in"
+                style={{ background: "rgba(251,191,36,0.04)" }}
+              >
+                <span className="font-medium">Укажи API ключ</span> — нажми для настройки провайдера и модели
+              </button>
+            )}
 
             {/* File context pills */}
             {files.length > 0 && (
