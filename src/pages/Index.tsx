@@ -1,16 +1,19 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import * as XLSX from "xlsx";
-import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer } from "recharts";
+import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid } from "recharts";
 import Icon from "@/components/ui/icon";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type CellValue = string | number | boolean | null;
 
+type ChartType = "pie" | "bar" | "line";
+
 interface SheetData {
   name: string;
   data: CellValue[][];
   colWidths: number[];
+  chartType?: ChartType;
 }
 
 interface ExcelFile {
@@ -327,44 +330,13 @@ function SettingsModal({ settings, onChange, onClose }: SettingsModalProps) {
   );
 }
 
-// ─── Excel chart builder ─────────────────────────────────────────────────────
+// ─── Detect chart type from sheet name / prompt ──────────────────────────────
 
-async function buildChartXlsx(
-  file: ExcelFile,
-  chartSheetName: string,
-  chartType: string,
-  chartTitle: string
-): Promise<void> {
-  const sheetsPayload = file.sheets.map((sh) => ({
-    name: sh.name,
-    data: sh.data.filter((r) => r.some((c) => c !== null)),
-  }));
-
-  const resp = await fetch(CHART_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      sheets: sheetsPayload,
-      chart_sheet: chartSheetName,
-      chart_type: chartType,
-      chart_title: chartTitle,
-    }),
-  });
-
-  if (!resp.ok) throw new Error(`Ошибка генерации графика: ${resp.status}`);
-  const { xlsx_b64 } = await resp.json();
-
-  // Скачиваем файл
-  const binary = atob(xlsx_b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const blob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = file.name.replace(/\.(xlsx|xls|csv)$/i, "") + "_с_графиком.xlsx";
-  a.click();
-  URL.revokeObjectURL(url);
+function detectChartType(sheetName: string): ChartType {
+  const n = sheetName.toLowerCase();
+  if (n.includes("бар") || n.includes("bar") || n.includes("столб")) return "bar";
+  if (n.includes("линия") || n.includes("line") || n.includes("динам")) return "line";
+  return "pie";
 }
 
 // ─── Real AI call ─────────────────────────────────────────────────────────────
@@ -606,12 +578,15 @@ export default function Index() {
             );
             next = next.map((f) => {
               if (f.id !== fileId) return f;
+              const isChart = chartData != null && fileId === firstMut.fileId && sheetName === firstMut.sheetName;
+              const ct: ChartType | undefined = isChart ? detectChartType(sheetName) : undefined;
               const existing = f.sheets.findIndex((s) => s.name === sheetName);
               let sheets = [...f.sheets];
+              const newSheet: SheetData = { name: sheetName, data: padded, colWidths: Array(COLS).fill(120), chartType: ct };
               if (existing >= 0) {
-                sheets[existing] = { name: sheetName, data: padded, colWidths: Array(COLS).fill(120) };
+                sheets[existing] = newSheet;
               } else {
-                sheets = [...sheets, { name: sheetName, data: padded, colWidths: Array(COLS).fill(120) }];
+                sheets = [...sheets, newSheet];
               }
               return { ...f, sheets, activeSheet: sheets.length - 1, isDirty: true };
             });
@@ -619,30 +594,11 @@ export default function Index() {
           return next;
         });
         setActiveFileId(firstMut.fileId);
-
-        // Если есть данные для графика — генерируем xlsx с диаграммой и скачиваем
-        if (chartData && chartData.length > 0) {
-          // Берём актуальный файл после обновления состояния
-          const targetFile = files.find(f => f.id === firstMut.fileId);
-          if (targetFile) {
-            // Добавляем новый лист в копию файла для отправки
-            const COLS = Math.max(...firstMut.data.map(r => r.length), 2);
-            const updatedFile: ExcelFile = {
-              ...targetFile,
-              sheets: [
-                ...targetFile.sheets.filter(s => s.name !== firstMut.sheetName),
-                { name: firstMut.sheetName, data: firstMut.data, colWidths: Array(COLS).fill(120) },
-              ],
-            };
-            buildChartXlsx(updatedFile, firstMut.sheetName, "pie", chartTitle ?? firstMut.sheetName)
-              .catch(() => {/* тихо игнорируем ошибку скачивания */});
-          }
-        }
       }
 
       setMessages((prev) => [...prev, {
         role: "ai",
-        text: result.text + (chartData ? "\n\n📥 **Файл с графиком скачивается автоматически**" : ""),
+        text: result.text,
         ts: getTime(),
         chartData,
         chartTitle,
@@ -898,8 +854,78 @@ export default function Index() {
             </div>
           )}
 
+          {/* ── Chart view ── */}
+          {activeFile && activeSheet && activeSheet.chartType && (() => {
+            const dataRows = activeSheet.data.filter(r => r[0] != null && r[1] != null);
+            const header = dataRows[0];
+            const rows = dataRows.slice(1);
+            const chartData = rows.map(r => ({ name: String(r[0]), value: Number(r[1]) })).filter(r => !isNaN(r.value));
+            const chartData2 = rows.map(r => ({ name: String(r[0]), v1: Number(r[1]), v2: r[2] != null ? Number(r[2]) : undefined }));
+            const COLORS = ["hsl(158,64%,52%)", "hsl(43,96%,58%)", "hsl(213,100%,65%)", "hsl(280,65%,65%)", "hsl(10,80%,60%)", "hsl(170,60%,50%)", "hsl(330,70%,60%)", "hsl(55,90%,55%)"];
+            void chartData2; void header;
+            return (
+              <div className="flex-1 flex flex-col items-center justify-center p-8 overflow-auto" style={{ background: "hsl(220,16%,5.5%)" }}>
+                <div className="w-full max-w-3xl">
+                  <div className="flex items-center justify-between mb-6">
+                    <div>
+                      <h2 className="text-lg font-semibold text-foreground">{activeSheet.name}</h2>
+                      <p className="text-xs text-muted-foreground mt-0.5">{chartData.length} значений</p>
+                    </div>
+                    <div className="flex gap-1">
+                      {(["pie","bar","line"] as ChartType[]).map(t => (
+                        <button key={t} onClick={() => {
+                          setFiles(prev => prev.map(f => f.id !== activeFileId ? f : {
+                            ...f, sheets: f.sheets.map((s, si) => si !== f.activeSheet ? s : { ...s, chartType: t })
+                          }));
+                        }} className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${activeSheet.chartType === t ? "btn-primary" : "bg-secondary text-muted-foreground hover:text-foreground"}`}>
+                          {t === "pie" ? "Круговой" : t === "bar" ? "Столбчатый" : "Линейный"}
+                        </button>
+                      ))}
+                      <button onClick={() => {
+                        setFiles(prev => prev.map(f => f.id !== activeFileId ? f : {
+                          ...f, sheets: f.sheets.map((s, si) => si !== f.activeSheet ? s : { ...s, chartType: undefined })
+                        }));
+                      }} className="px-3 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground bg-secondary transition-all ml-2">
+                        Таблица
+                      </button>
+                    </div>
+                  </div>
+                  <ResponsiveContainer width="100%" height={420}>
+                    {activeSheet.chartType === "pie" ? (
+                      <PieChart>
+                        <Pie data={chartData} cx="50%" cy="50%" outerRadius={160} innerRadius={60} paddingAngle={3} dataKey="value" label={({ name, percent }) => `${name} ${(percent * 100).toFixed(1)}%`} labelLine={true}>
+                          {chartData.map((_, ci) => <Cell key={ci} fill={COLORS[ci % COLORS.length]} />)}
+                        </Pie>
+                        <Tooltip contentStyle={{ background: "hsl(220,14%,10%)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 12 }} />
+                        <Legend wrapperStyle={{ fontSize: 12, color: "hsl(215,14%,65%)" }} />
+                      </PieChart>
+                    ) : activeSheet.chartType === "bar" ? (
+                      <BarChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 40 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                        <XAxis dataKey="name" tick={{ fill: "hsl(215,14%,55%)", fontSize: 11 }} angle={-30} textAnchor="end" />
+                        <YAxis tick={{ fill: "hsl(215,14%,55%)", fontSize: 11 }} />
+                        <Tooltip contentStyle={{ background: "hsl(220,14%,10%)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 12 }} />
+                        <Bar dataKey="value" radius={[4, 4, 0, 0]}>
+                          {chartData.map((_, ci) => <Cell key={ci} fill={COLORS[ci % COLORS.length]} />)}
+                        </Bar>
+                      </BarChart>
+                    ) : (
+                      <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 40 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                        <XAxis dataKey="name" tick={{ fill: "hsl(215,14%,55%)", fontSize: 11 }} angle={-30} textAnchor="end" />
+                        <YAxis tick={{ fill: "hsl(215,14%,55%)", fontSize: 11 }} />
+                        <Tooltip contentStyle={{ background: "hsl(220,14%,10%)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, fontSize: 12 }} />
+                        <Line type="monotone" dataKey="value" stroke="hsl(158,64%,52%)" strokeWidth={2} dot={{ fill: "hsl(158,64%,52%)", r: 4 }} />
+                      </LineChart>
+                    )}
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            );
+          })()}
+
           {/* ── Spreadsheet ── */}
-          {activeFile && activeSheet && (
+          {activeFile && activeSheet && !activeSheet.chartType && (
             <div
               ref={tableRef}
               className="flex-1 overflow-auto scrollbar-thin"
