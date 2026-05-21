@@ -591,6 +591,9 @@ async function callAi(
       ],
       max_tokens: 4000,
       temperature: 0.1,
+      ...(effectiveModel.includes("r1") || effectiveModel.includes("think")
+        ? { reasoning_effort: "medium" }
+        : {}),
     }),
   });
 
