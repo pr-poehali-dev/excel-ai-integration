@@ -36,7 +36,7 @@ SYSTEM_PROMPT = """Ты — профессиональный аналитик д
 1. Поле "text" — ОБЯЗАТЕЛЬНО всегда
 2. Поле "new_sheet" — включай когда нужно создать новый лист с данными/расчётами/графиком
 3. Поле "cell_styles" — включай когда нужно покрасить/форматировать ячейки в СУЩЕСТВУЮЩЕМ листе, НЕ создавая новый лист
-4. "cell_styles[].changes[].row" и "col" — 0-based индексы строки и столбца
+4. "cell_styles[].changes[].row" и "col" — 0-based индексы строки и столбца. Данные файла передаются с колонкой ROW — это и есть row-индекс для cell_styles
 5. "bgColor" — цвет заливки в формате AARRGGBB (например FF FFFF00 = жёлтый, FFFFA500 = оранжевый, FF92D050 = зелёный, FFFF0000 = красный)
 6. "fontColor" — цвет текста в формате AARRGGBB
 7. "bold": true/false — жирный шрифт
@@ -114,7 +114,7 @@ def handler(event: dict, context) -> dict:
             "body": json.dumps({"error": "API ключ не указан"}, ensure_ascii=False),
         }
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=25.0)
 
     # Формируем контекст из файлов
     context_parts = []
@@ -145,15 +145,25 @@ def handler(event: dict, context) -> dict:
     else:
         user_content = text_block
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        max_tokens=6000,
-        temperature=0.1,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=4000,
+            temperature=0.1,
+        )
+    except Exception as e:
+        err_msg = str(e)
+        if "timeout" in err_msg.lower() or "timed out" in err_msg.lower():
+            err_msg = "Модель не успела ответить за отведённое время. Попробуй ещё раз или выбери более быструю модель (например GPT-4o mini или Gemini Flash)."
+        return {
+            "statusCode": 200,
+            "headers": {"Access-Control-Allow-Origin": "*", "Content-Type": "application/json"},
+            "body": json.dumps({"text": f"⚠️ {err_msg}"}, ensure_ascii=False),
+        }
 
     raw = response.choices[0].message.content or "{}"
     print(f"[AI RAW RESPONSE]: {raw[:500]}")

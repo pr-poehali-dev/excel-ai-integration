@@ -289,11 +289,16 @@ function buildWorkbook(file: ExcelFile): XLSX.WorkBook {
 }
 
 function sheetToText(sh: SheetData): string {
-  return sh.cells
-    .filter(r => r.some(c => c.v !== null))
-    .slice(0, 60)
-    .map(r => r.map(c => c.w ?? (c.v !== null ? String(c.v) : "")).join("\t"))
-    .join("\n");
+  // Передаём строки с реальными данными + номер строки (0-based row index) для точного позиционирования ИИ
+  const result: string[] = [];
+  sh.cells.forEach((row, ri) => {
+    if (!row.some(c => c.v !== null)) return;
+    const vals = row.map(c => c.w ?? (c.v !== null ? String(c.v) : "")).join("\t");
+    result.push(`${ri}\t${vals}`);
+  });
+  // Максимум 200 строк чтобы не превышать контекст
+  return ["ROW\t" + Array.from({ length: sh.cells[0]?.length ?? 0 }, (_, i) => String.fromCharCode(65 + i)).join("\t"),
+    ...result.slice(0, 200)].join("\n");
 }
 
 // ─── AI Settings ─────────────────────────────────────────────────────────────
