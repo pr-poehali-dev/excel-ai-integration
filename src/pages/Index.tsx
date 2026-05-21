@@ -538,9 +538,28 @@ export default function Index() {
     setAiError(null);
     try {
       const result = await callAi(text, files, aiSettings);
-      if (result.mutations) {
-        result.mutations.forEach((m) => addSheet(m.fileId, m.sheetName, m.data));
-        setActiveFileId(result.mutations[0].fileId);
+      if (result.mutations && result.mutations.length > 0) {
+        const firstMutation = result.mutations[0];
+        // Применяем все листы и сразу переключаем активный файл + лист
+        result.mutations.forEach(({ fileId, sheetName, data }) => {
+          const ROWS = Math.max(data.length + 10, 50);
+          const COLS = Math.max(...data.map((r) => r.length), 20);
+          const padded: CellValue[][] = Array.from({ length: ROWS }, (_, r) =>
+            Array.from({ length: COLS }, (_, c) => data[r]?.[c] ?? null)
+          );
+          setFiles((prev) => prev.map((f) => {
+            if (f.id !== fileId) return f;
+            const existing = f.sheets.findIndex((s) => s.name === sheetName);
+            let sheets = [...f.sheets];
+            if (existing >= 0) {
+              sheets[existing] = { name: sheetName, data: padded, colWidths: Array(COLS).fill(100) };
+            } else {
+              sheets = [...sheets, { name: sheetName, data: padded, colWidths: Array(COLS).fill(100) }];
+            }
+            return { ...f, sheets, activeSheet: sheets.length - 1, isDirty: true };
+          }));
+        });
+        setActiveFileId(firstMutation.fileId);
       }
       setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime() }]);
     } catch (err) {
