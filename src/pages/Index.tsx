@@ -104,13 +104,12 @@ const PRESET_PROVIDERS = [
 ];
 
 const PRESET_MODELS = [
-  { label: "DeepSeek V3 (Chat)", value: "deepseek/deepseek-chat-v3-0324:free" },
-  { label: "DeepSeek V3 Pro", value: "deepseek/deepseek-chat-v3-5k" },
-  { label: "GPT-4o mini", value: "gpt-4o-mini" },
-  { label: "GPT-4o", value: "gpt-4o" },
+  { label: "DeepSeek V3 Chat", value: "deepseek/deepseek-chat" },
+  { label: "DeepSeek R1", value: "deepseek/deepseek-r1" },
+  { label: "GPT-4o mini", value: "openai/gpt-4o-mini" },
+  { label: "GPT-4o", value: "openai/gpt-4o" },
   { label: "Claude 3.5 Haiku", value: "anthropic/claude-3-5-haiku" },
   { label: "Gemini 2.0 Flash", value: "google/gemini-2.0-flash-001" },
-  { label: "Своя модель", value: "__custom__" },
 ];
 
 interface AiSettings {
@@ -128,7 +127,7 @@ function loadSettings(): AiSettings {
   return {
     apiKey: "",
     baseUrl: "https://routerai.ru/api/v1",
-    model: "deepseek/deepseek-chat-v3-0324:free",
+    model: "deepseek/deepseek-chat",
     customModel: "",
   };
 }
@@ -148,8 +147,26 @@ interface SettingsModalProps {
 function SettingsModal({ settings, onChange, onClose }: SettingsModalProps) {
   const [local, setLocal] = useState<AiSettings>(settings);
   const [showKey, setShowKey] = useState(false);
+  const [liveModels, setLiveModels] = useState<{id: string; name: string}[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   const update = (patch: Partial<AiSettings>) => setLocal((prev) => ({ ...prev, ...patch }));
+
+  const fetchModels = async () => {
+    if (!local.baseUrl) return;
+    setLoadingModels(true);
+    try {
+      const resp = await fetch(`${local.baseUrl.replace(/\/$/, "")}/models`, {
+        headers: local.apiKey ? { Authorization: `Bearer ${local.apiKey}` } : {},
+      });
+      const json = await resp.json();
+      const models = (json.data as {id: string; name?: string}[])
+        .map(m => ({ id: m.id, name: m.name || m.id }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+      setLiveModels(models);
+    } catch { void 0; }
+    finally { setLoadingModels(false); }
+  };
 
   const handleSave = () => {
     saveSettings(local);
@@ -243,13 +260,43 @@ function SettingsModal({ settings, onChange, onClose }: SettingsModalProps) {
                 </button>
               ))}
             </div>
-            <input
-              value={local.model === "__custom__" ? local.customModel : (PRESET_MODELS.find(m => m.value === local.model) ? "" : local.model)}
-              onChange={(e) => update({ model: e.target.value, customModel: e.target.value })}
-              placeholder="Или введи свою модель: deepseek/..."
-              className="w-full px-3 py-2 rounded-lg border border-border/50 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 transition-all font-mono"
-              style={{ background: "rgba(255,255,255,0.03)" }}
-            />
+            <div className="flex gap-2">
+              <input
+                value={PRESET_MODELS.find(m => m.value === local.model) ? "" : local.model}
+                onChange={(e) => update({ model: e.target.value })}
+                placeholder="Введи точный slug модели: deepseek/..."
+                className="flex-1 px-3 py-2 rounded-lg border border-border/50 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 transition-all font-mono"
+                style={{ background: "rgba(255,255,255,0.03)" }}
+              />
+              <button
+                onClick={fetchModels}
+                disabled={loadingModels}
+                className="px-3 py-2 rounded-lg text-xs border border-border/50 text-muted-foreground hover:text-foreground hover:border-primary/30 transition-all flex items-center gap-1.5 flex-shrink-0 disabled:opacity-50"
+                style={{ background: "rgba(255,255,255,0.02)" }}
+                title="Загрузить список моделей от провайдера"
+              >
+                <Icon name={loadingModels ? "Loader2" : "RefreshCw"} size={12} className={loadingModels ? "spinner" : ""} />
+                <span className="hidden sm:inline">Загрузить</span>
+              </button>
+            </div>
+
+            {/* Live models list */}
+            {liveModels.length > 0 && (
+              <div className="mt-2 max-h-36 overflow-y-auto scrollbar-thin rounded-lg border border-border/40"
+                style={{ background: "rgba(255,255,255,0.02)" }}>
+                {liveModels.map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => update({ model: m.id })}
+                    className={`w-full text-left px-3 py-1.5 text-[11px] font-mono transition-colors border-b border-border/20 last:border-0 ${
+                      local.model === m.id ? "text-primary bg-primary/5" : "text-muted-foreground hover:text-foreground hover:bg-white/[0.02]"
+                    }`}
+                  >
+                    {m.id}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Summary */}
