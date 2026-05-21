@@ -1,509 +1,776 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
+import * as XLSX from "xlsx";
 import Icon from "@/components/ui/icon";
 
-type FileStatus = "idle" | "loading" | "ready" | "error";
-type AiStatus = "idle" | "thinking" | "done";
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-interface Column {
+type CellValue = string | number | boolean | null;
+
+interface SheetData {
   name: string;
-  type: string;
-  nulls: number;
-  sample: string;
+  data: CellValue[][];
+  colWidths: number[];
 }
 
-interface SheetInfo {
+interface ExcelFile {
+  id: string;
   name: string;
-  rows: number;
-  cols: number;
-  columns: Column[];
+  role: "main" | "reference" | null;
+  sheets: SheetData[];
+  activeSheet: number;
+  workbook: XLSX.WorkBook;
+  isDirty: boolean;
 }
 
 interface ChatMessage {
   role: "user" | "ai";
   text: string;
   ts: string;
+  refs?: string[];
 }
 
-const MOCK_SHEET: SheetInfo = {
-  name: "Продажи_Q1",
-  rows: 4821,
-  cols: 12,
-  columns: [
-    { name: "ID", type: "Целое", nulls: 0, sample: "1, 2, 3..." },
-    { name: "Дата", type: "Дата", nulls: 3, sample: "2024-01-15" },
-    { name: "Менеджер", type: "Текст", nulls: 0, sample: "Иванов А." },
-    { name: "Продукт", type: "Текст", nulls: 0, sample: "Ноутбук Pro" },
-    { name: "Количество", type: "Целое", nulls: 7, sample: "1–50" },
-    { name: "Цена", type: "Число", nulls: 0, sample: "12 500.00" },
-    { name: "Сумма", type: "Число", nulls: 7, sample: "625 000.00" },
-    { name: "Регион", type: "Текст", nulls: 12, sample: "Москва" },
-    { name: "Категория", type: "Текст", nulls: 0, sample: "Электроника" },
-    { name: "Статус", type: "Текст", nulls: 4, sample: "Выполнен" },
-    { name: "Канал", type: "Текст", nulls: 18, sample: "Онлайн" },
-    { name: "Комментарий", type: "Текст", nulls: 389, sample: "—" },
-  ],
-};
+interface Selection {
+  fileId: string;
+  sheet: number;
+  row: number;
+  col: number;
+}
 
-const MOCK_AI_REPLIES: Record<string, string> = {
-  default:
-    "Данные загружены и проанализированы. В таблице обнаружено **12 столбцов** и **4 821 строка**. Есть пропуски в полях «Дата» (3), «Количество» (7) и «Комментарий» (389) — рекомендую заполнить или исключить перед финальным анализом.",
-  пропуск:
-    "Пропущенные значения найдены в 5 полях. Критичные: «Сумма» (7 строк) — скорее всего формульные ошибки. Некритичные: «Комментарий» (389) — опциональное поле.",
-  сумм: "Суммарная выручка по колонке «Сумма» составляет приблизительно **310 млн руб.** (при среднем чеке ~64 200 руб.). Топ-регион — Москва: ~38% объёма.",
-  менедж:
-    "По менеджерам: в данных встречается ~24 уникальных имени. Рекомендую сводную таблицу по полю «Менеджер» → «Сумма» для ранжирования.",
-};
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function colLetter(n: number) {
+  let s = "";
+  while (n >= 0) {
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26) - 1;
+  }
+  return s;
+}
 
 function getTime() {
   return new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
 }
 
-function getAiReply(input: string): string {
-  const lower = input.toLowerCase();
-  for (const key of Object.keys(MOCK_AI_REPLIES)) {
-    if (key !== "default" && lower.includes(key)) return MOCK_AI_REPLIES[key];
-  }
-  return MOCK_AI_REPLIES.default;
+function uid() {
+  return Math.random().toString(36).slice(2, 8);
 }
 
-const TYPE_COLORS: Record<string, string> = {
-  Целое: "tag-blue",
-  Число: "tag-emerald",
-  Дата: "tag-amber",
-  Текст: "bg-purple-500/10 text-purple-300 border border-purple-500/20",
-};
+function parseWorkbook(wb: XLSX.WorkBook, name: string, id: string): ExcelFile {
+  const sheets: SheetData[] = wb.SheetNames.map((sn) => {
+    const ws = wb.Sheets[sn];
+    const raw: CellValue[][] = XLSX.utils.sheet_to_json(ws, {
+      header: 1,
+      defval: null,
+      blankrows: true,
+    }) as CellValue[][];
+    // ensure at least 50 rows × 20 cols
+    const ROWS = Math.max((raw.length || 0) + 10, 50);
+    const COLS = Math.max(...raw.map((r) => r.length), 20);
+    const data: CellValue[][] = Array.from({ length: ROWS }, (_, r) =>
+      Array.from({ length: COLS }, (_, c) => raw[r]?.[c] ?? null)
+    );
+    const colWidths = Array.from({ length: COLS }, () => 100);
+    return { name: sn, data, colWidths };
+  });
+  return { id, name, role: null, sheets, activeSheet: 0, workbook: wb, isDirty: false };
+}
+
+function buildWorkbook(file: ExcelFile): XLSX.WorkBook {
+  const wb = XLSX.utils.book_new();
+  file.sheets.forEach((sh) => {
+    const ws = XLSX.utils.aoa_to_sheet(sh.data);
+    XLSX.utils.book_append_sheet(wb, ws, sh.name);
+  });
+  return wb;
+}
+
+function fileToContext(file: ExcelFile): string {
+  return file.sheets
+    .map((sh) => {
+      const rows = sh.data.filter((r) => r.some((c) => c !== null));
+      const preview = rows
+        .slice(0, 40)
+        .map((r) => r.join("\t"))
+        .join("\n");
+      return `### Файл «${file.name}» / Лист «${sh.name}»\n${preview}`;
+    })
+    .join("\n\n");
+}
+
+// ─── Mock AI ─────────────────────────────────────────────────────────────────
+
+async function mockAiProcess(
+  prompt: string,
+  files: ExcelFile[]
+): Promise<{ text: string; mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[] }> {
+  const lower = prompt.toLowerCase();
+
+  // Simulate a delay
+  await new Promise((r) => setTimeout(r, 1600));
+
+  if (files.length === 0) {
+    return { text: "Загрузи хотя бы один файл, чтобы я мог с ним работать." };
+  }
+
+  const mainFile = files.find((f) => f.role === "main") ?? files[0];
+  const refFile = files.find((f) => f.role === "reference");
+
+  // Aggregate / sum command
+  if (lower.includes("сумм") || lower.includes("итог") || lower.includes("итого")) {
+    const sh = mainFile.sheets[mainFile.activeSheet];
+    const header = sh.data[0];
+    const numericCols: number[] = [];
+    header?.forEach((h, i) => {
+      if (typeof h === "string" && (h.toLowerCase().includes("сумм") || h.toLowerCase().includes("цен") || h.toLowerCase().includes("кол"))) {
+        numericCols.push(i);
+      }
+    });
+    if (numericCols.length === 0) numericCols.push(...[...Array(header?.length ?? 3).keys()].slice(1, 4));
+
+    const newSheet: CellValue[][] = [["Столбец", "Сумма", "Среднее", "Кол-во строк"]];
+    numericCols.forEach((ci) => {
+      const vals = sh.data
+        .slice(1)
+        .map((r) => Number(r[ci]))
+        .filter((v) => !isNaN(v) && v !== 0);
+      const sum = vals.reduce((a, b) => a + b, 0);
+      newSheet.push([header?.[ci] ?? `Столбец ${ci + 1}`, Math.round(sum * 100) / 100, vals.length ? Math.round((sum / vals.length) * 100) / 100 : 0, vals.length]);
+    });
+
+    return {
+      text: `Выполнено! Создан новый лист «Итоги_ИИ» в файле «${mainFile.name}» с агрегированными суммами по числовым столбцам (${numericCols.length} шт.). Данные из ${sh.data.length - 1} строк.`,
+      mutations: [{ fileId: mainFile.id, sheetName: "Итоги_ИИ", data: newSheet }],
+    };
+  }
+
+  // Copy + transform from ref to main
+  if ((lower.includes("образец") || lower.includes("формат") || lower.includes("шаблон")) && refFile) {
+    const refSh = refFile.sheets[0];
+    const mainSh = mainFile.sheets[mainFile.activeSheet];
+    const newRows: CellValue[][] = [refSh.data[0] ?? mainSh.data[0]];
+    mainSh.data.slice(1).forEach((row) => newRows.push([...row]));
+    return {
+      text: `Готово! Создал лист «Результат_ИИ» в «${mainFile.name}» — применил заголовки из образца «${refFile.name}» и заполнил данными из основного файла.`,
+      mutations: [{ fileId: mainFile.id, sheetName: "Результат_ИИ", data: newRows }],
+    };
+  }
+
+  // Deduplicate
+  if (lower.includes("дубл") || lower.includes("уникальн")) {
+    const sh = mainFile.sheets[mainFile.activeSheet];
+    const seen = new Set<string>();
+    const unique = sh.data.filter((row) => {
+      const key = JSON.stringify(row);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return {
+      text: `Удалено дублей: ${sh.data.length - unique.length}. Уникальных строк: ${unique.length}. Результат записан на лист «Без_дублей».`,
+      mutations: [{ fileId: mainFile.id, sheetName: "Без_дублей", data: unique }],
+    };
+  }
+
+  // Sort
+  if (lower.includes("сортир") || lower.includes("упоряд")) {
+    const sh = mainFile.sheets[mainFile.activeSheet];
+    const header = sh.data[0] ?? [];
+    const rows = [...sh.data.slice(1)].sort((a, b) => {
+      const va = a[1] ?? "";
+      const vb = b[1] ?? "";
+      return String(va).localeCompare(String(vb), "ru");
+    });
+    return {
+      text: `Данные отсортированы по второму столбцу. Результат — лист «Сортировка».`,
+      mutations: [{ fileId: mainFile.id, sheetName: "Сортировка", data: [header, ...rows] }],
+    };
+  }
+
+  // Generic with context
+  const ctx = files.map((f) => `«${f.name}» (${f.sheets.length} лист(ов), ${f.sheets[0]?.data?.length ?? 0} строк)`).join(", ");
+  return {
+    text: `Вижу ${files.length} загруженных файл(а): ${ctx}.\n\nЯ могу:\n• **Посчитать итоги/суммы** → «посчитай суммы»\n• **Убрать дубли** → «удали дубликаты»\n• **Сортировать** → «отсортируй данные»\n• **Применить формат из образца** → «возьми формат из файла 2»\n\nНапиши конкретное задание!`,
+  };
+}
+
+// ─── Cell Editor ──────────────────────────────────────────────────────────────
+
+interface CellEditorProps {
+  value: CellValue;
+  onCommit: (v: CellValue) => void;
+  onCancel: () => void;
+}
+function CellEditor({ value, onCommit, onCancel }: CellEditorProps) {
+  const [v, setV] = useState(String(value ?? ""));
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => { ref.current?.focus(); ref.current?.select(); }, []);
+  return (
+    <input
+      ref={ref}
+      value={v}
+      onChange={(e) => setV(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") onCommit(v === "" ? null : isNaN(Number(v)) ? v : Number(v));
+        if (e.key === "Escape") onCancel();
+      }}
+      onBlur={() => onCommit(v === "" ? null : isNaN(Number(v)) ? v : Number(v))}
+      className="absolute inset-0 w-full h-full px-1 text-xs bg-[rgba(52,211,153,0.12)] border border-primary outline-none text-foreground font-mono z-10"
+      style={{ fontFamily: "'IBM Plex Mono', monospace" }}
+    />
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
+
+const VISIBLE_ROWS = 60;
+const VISIBLE_COLS = 26;
 
 export default function Index() {
-  const [fileStatus, setFileStatus] = useState<FileStatus>("idle");
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [sheet, setSheet] = useState<SheetInfo | null>(null);
-  const [dragOver, setDragOver] = useState(false);
-  const [activeTab, setActiveTab] = useState<"structure" | "preview" | "stats">("structure");
+  const [files, setFiles] = useState<ExcelFile[]>([]);
+  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
+  const [selected, setSelected] = useState<{ row: number; col: number } | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "ai",
-      text: "Привет! Загрузи Excel-файл слева, и я сразу проанализирую его структуру. Потом можешь задать любой вопрос по данным.",
+      text: "Загрузи один или несколько Excel-файлов. Я вижу все их содержимое и могу выполнять задания — считать, трансформировать, создавать новые листы. Пример: «возьми данные из Файл1, образец из Файл2, сделай итоговую таблицу на новом листе».",
       ts: getTime(),
     },
   ]);
-  const [input, setInput] = useState("");
-  const [aiStatus, setAiStatus] = useState<AiStatus>("idle");
+  const [aiInput, setAiInput] = useState("");
+  const [aiThinking, setAiThinking] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const tableRef = useRef<HTMLDivElement>(null);
 
-  const handleFile = useCallback((file: File) => {
-    if (!file.name.match(/\.(xlsx|xls|csv)$/i)) {
-      setFileStatus("error");
-      return;
-    }
-    setFileName(file.name);
-    setFileStatus("loading");
-    setTimeout(() => {
-      setFileStatus("ready");
-      setSheet(MOCK_SHEET);
+  const activeFile = files.find((f) => f.id === activeFileId) ?? null;
+  const activeSheet = activeFile ? activeFile.sheets[activeFile.activeSheet] : null;
+
+  // ── Load file ──
+  const loadFile = useCallback((file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const data = new Uint8Array(e.target!.result as ArrayBuffer);
+      const wb = XLSX.read(data, { type: "array" });
+      const id = uid();
+      const ef = parseWorkbook(wb, file.name, id);
+      setFiles((prev) => {
+        const next = [...prev, ef];
+        return next;
+      });
+      setActiveFileId(id);
       setMessages((prev) => [
         ...prev,
         {
           role: "ai",
-          text: `Файл **«${file.name}»** успешно загружен. Обнаружен лист «${MOCK_SHEET.name}» — ${MOCK_SHEET.rows.toLocaleString("ru")} строк, ${MOCK_SHEET.cols} колонок. Структура отображена слева. Можешь спрашивать!`,
+          text: `Файл **«${file.name}»** загружен: ${ef.sheets.length} лист(а/ов), первый лист — ${ef.sheets[0]?.data?.filter((r) => r.some((c) => c !== null)).length ?? 0} строк данных.`,
           ts: getTime(),
+          refs: [file.name],
         },
       ]);
-    }, 1800);
+    };
+    reader.readAsArrayBuffer(file);
   }, []);
 
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragOver(false);
-      const file = e.dataTransfer.files[0];
-      if (file) handleFile(file);
+  const handleFiles = useCallback(
+    (fileList: FileList) => {
+      Array.from(fileList).forEach((f) => {
+        if (f.name.match(/\.(xlsx|xls|csv)$/i)) loadFile(f);
+      });
     },
-    [handleFile]
+    [loadFile]
   );
 
-  const handleSend = () => {
-    const text = input.trim();
-    if (!text || aiStatus === "thinking") return;
+  // ── Cell update ──
+  const updateCell = useCallback(
+    (row: number, col: number, value: CellValue) => {
+      if (!activeFile) return;
+      setFiles((prev) =>
+        prev.map((f) => {
+          if (f.id !== activeFile.id) return f;
+          const sheets = f.sheets.map((sh, si) => {
+            if (si !== f.activeSheet) return sh;
+            const data = sh.data.map((r, ri) =>
+              ri === row ? r.map((c, ci) => (ci === col ? value : c)) : r
+            );
+            return { ...sh, data };
+          });
+          return { ...f, sheets, isDirty: true };
+        })
+      );
+    },
+    [activeFile]
+  );
+
+  // ── Add new sheet ──
+  const addSheet = useCallback(
+    (fileId: string, name: string, data: CellValue[][]) => {
+      setFiles((prev) =>
+        prev.map((f) => {
+          if (f.id !== fileId) return f;
+          const ROWS = Math.max(data.length + 10, 50);
+          const COLS = Math.max(...data.map((r) => r.length), 20);
+          const padded = Array.from({ length: ROWS }, (_, r) =>
+            Array.from({ length: COLS }, (_, c) => data[r]?.[c] ?? null)
+          );
+          const existing = f.sheets.findIndex((s) => s.name === name);
+          let sheets = [...f.sheets];
+          if (existing >= 0) {
+            sheets[existing] = { name, data: padded, colWidths: Array(COLS).fill(100) };
+          } else {
+            sheets = [...sheets, { name, data: padded, colWidths: Array(COLS).fill(100) }];
+          }
+          return { ...f, sheets, activeSheet: sheets.length - 1, isDirty: true };
+        })
+      );
+    },
+    []
+  );
+
+  // ── Save file ──
+  const saveFile = useCallback(
+    (fileId: string) => {
+      const f = files.find((ff) => ff.id === fileId);
+      if (!f) return;
+      const wb = buildWorkbook(f);
+      XLSX.writeFile(wb, f.name);
+      setFiles((prev) => prev.map((ff) => (ff.id === fileId ? { ...ff, isDirty: false } : ff)));
+    },
+    [files]
+  );
+
+  // ── AI send ──
+  const handleAiSend = async () => {
+    const text = aiInput.trim();
+    if (!text || aiThinking) return;
     setMessages((prev) => [...prev, { role: "user", text, ts: getTime() }]);
-    setInput("");
-    setAiStatus("thinking");
-    setTimeout(() => {
-      setMessages((prev) => [
-        ...prev,
-        { role: "ai", text: getAiReply(text), ts: getTime() },
-      ]);
-      setAiStatus("done");
-      setTimeout(() => setAiStatus("idle"), 500);
-      setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
-    }, 1400);
+    setAiInput("");
+    setAiThinking(true);
+    try {
+      const result = await mockAiProcess(text, files);
+      if (result.mutations) {
+        result.mutations.forEach((m) => addSheet(m.fileId, m.sheetName, m.data));
+        setActiveFileId(result.mutations[0].fileId);
+      }
+      setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime() }]);
+    } finally {
+      setAiThinking(false);
+      setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 80);
+    }
   };
 
   const renderMarkdown = (text: string) =>
     text
-      .replace(/\*\*(.*?)\*\*/g, '<strong class="text-emerald-400">$1</strong>')
-      .replace(/«(.*?)»/g, '<span class="text-amber-300">«$1»</span>');
+      .replace(/\*\*(.*?)\*\*/g, '<strong style="color:hsl(158,64%,60%)">$1</strong>')
+      .replace(/•/g, '<span style="color:hsl(43,96%,60%)">•</span>')
+      .replace(/\n/g, "<br/>");
+
+  // ── Keyboard navigation ──
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (editing || !selected || !activeSheet) return;
+      const { row, col } = selected;
+      const maxRow = activeSheet.data.length - 1;
+      const maxCol = (activeSheet.data[0]?.length ?? 1) - 1;
+      if (e.key === "ArrowDown") { e.preventDefault(); setSelected({ row: Math.min(row + 1, maxRow), col }); }
+      if (e.key === "ArrowUp") { e.preventDefault(); setSelected({ row: Math.max(row - 1, 0), col }); }
+      if (e.key === "ArrowRight") { e.preventDefault(); setSelected({ row, col: Math.min(col + 1, maxCol) }); }
+      if (e.key === "ArrowLeft") { e.preventDefault(); setSelected({ row, col: Math.max(col - 1, 0) }); }
+      if (e.key === "Enter" || e.key === "F2") { e.preventDefault(); setEditing(selected); }
+      if (e.key === "Delete" || e.key === "Backspace") { updateCell(row, col, null); }
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+        setEditing(selected);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [editing, selected, activeSheet, updateCell]);
+
+  // ── Save shortcut ──
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "s" && activeFileId) {
+        e.preventDefault();
+        saveFile(activeFileId);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeFileId, saveFile]);
+
+  const visibleRows = activeSheet ? Math.min(activeSheet.data.length, VISIBLE_ROWS) : 0;
+  const visibleCols = activeSheet ? Math.min(activeSheet.data[0]?.length ?? 0, VISIBLE_COLS) : 0;
 
   return (
-    <div className="min-h-screen flex flex-col">
-      {/* Header */}
-      <header
-        className="border-b border-border/60 px-6 py-4 flex items-center justify-between backdrop-blur-sm sticky top-0 z-50"
-        style={{ background: "hsla(220,16%,6%,0.92)" }}
-      >
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg btn-primary flex items-center justify-center flex-shrink-0">
-            <Icon name="Sparkles" size={16} />
+    <div className="h-screen flex flex-col overflow-hidden">
+      {/* ── Header ── */}
+      <header className="border-b border-border/60 px-4 py-3 flex items-center gap-3 flex-shrink-0"
+        style={{ background: "hsla(220,16%,6%,0.97)" }}>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <div className="w-7 h-7 rounded-lg btn-primary flex items-center justify-center">
+            <Icon name="Sparkles" size={14} />
           </div>
-          <div>
-            <span className="font-semibold text-foreground tracking-tight">DataMind</span>
-            <span className="text-muted-foreground text-sm ml-2 hidden sm:inline">Excel AI Analyzer</span>
-          </div>
+          <span className="font-semibold text-sm text-foreground tracking-tight hidden sm:block">DataMind</span>
         </div>
-        <div className="flex items-center gap-2">
-          {fileStatus === "ready" && (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full tag-emerald text-xs font-medium animate-fade-in">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-              Файл загружен
-            </div>
-          )}
+
+        <div className="h-5 w-px bg-border/60 hidden sm:block" />
+
+        {/* File tabs */}
+        <div className="flex items-center gap-1 flex-1 overflow-x-auto scrollbar-thin min-w-0">
+          {files.map((f) => (
+            <button
+              key={f.id}
+              onClick={() => { setActiveFileId(f.id); setEditing(null); setSelected(null); }}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all ${
+                f.id === activeFileId
+                  ? "bg-primary/10 text-primary border border-primary/30"
+                  : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+              }`}
+            >
+              <Icon name="FileSpreadsheet" size={13} />
+              <span className="max-w-[120px] truncate">{f.name}</span>
+              {f.isDirty && <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0" />}
+              {f.role && (
+                <span className={`text-[10px] px-1 rounded ${f.role === "main" ? "tag-emerald" : "tag-blue"}`}>
+                  {f.role === "main" ? "осн." : "обр."}
+                </span>
+              )}
+              <button
+                onClick={(e) => { e.stopPropagation(); setFiles((prev) => prev.filter((ff) => ff.id !== f.id)); if (activeFileId === f.id) setActiveFileId(files.find((ff) => ff.id !== f.id)?.id ?? null); }}
+                className="ml-0.5 opacity-40 hover:opacity-100 transition-opacity"
+              >
+                <Icon name="X" size={11} />
+              </button>
+            </button>
+          ))}
           <button
             onClick={() => fileInputRef.current?.click()}
-            className="btn-amber px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2"
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all flex-shrink-0"
           >
-            <Icon name="Upload" size={15} />
-            Загрузить файл
+            <Icon name="Plus" size={13} />
+            <span className="hidden sm:inline">Открыть</span>
+          </button>
+        </div>
+
+        {/* Right actions */}
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {activeFile && (
+            <>
+              {/* Role assign */}
+              <select
+                value={activeFile.role ?? ""}
+                onChange={(e) => setFiles((prev) => prev.map((f) => f.id === activeFileId ? { ...f, role: (e.target.value as "main" | "reference") || null } : f))}
+                className="text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-2 py-1.5 outline-none hidden sm:block"
+              >
+                <option value="">— роль —</option>
+                <option value="main">Основной</option>
+                <option value="reference">Образец</option>
+              </select>
+              <button
+                onClick={() => saveFile(activeFile.id)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeFile.isDirty ? "btn-primary" : "bg-secondary text-muted-foreground"}`}
+              >
+                <Icon name="Save" size={13} />
+                <span className="hidden sm:inline">Сохранить</span>
+              </button>
+            </>
+          )}
+          <button
+            onClick={() => setSidebarOpen((p) => !p)}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all"
+          >
+            <Icon name="MessageSquare" size={14} />
           </button>
         </div>
       </header>
 
-      {/* Main layout */}
-      <div className="flex-1 flex overflow-hidden" style={{ height: "calc(100vh - 65px)" }}>
+      {/* ── Main ── */}
+      <div className="flex flex-1 overflow-hidden">
 
-        {/* Left panel */}
-        <div className="w-full md:w-[54%] lg:w-[58%] flex flex-col border-r border-border/60 overflow-hidden">
+        {/* ── Table area ── */}
+        <div className="flex flex-col flex-1 overflow-hidden min-w-0">
 
-          {/* Drop zone */}
-          <div className="p-4 border-b border-border/40">
-            <div
-              className={`relative border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-all duration-300 ${
-                dragOver ? "drop-zone-active" : "border-border/40 hover:border-border/70"
-              } ${fileStatus === "ready" ? "py-4" : ""}`}
-              style={{ background: "rgba(52,211,153,0.015)" }}
-              onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-              onDragLeave={() => setDragOver(false)}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".xlsx,.xls,.csv"
-                className="hidden"
-                onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
-              />
+          {/* Sheet tabs + formula bar */}
+          {activeFile && activeSheet && (
+            <>
+              {/* Formula bar */}
+              <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/40 flex-shrink-0"
+                style={{ background: "rgba(255,255,255,0.01)" }}>
+                <span className="text-xs font-mono text-muted-foreground w-12 text-center flex-shrink-0">
+                  {selected ? `${colLetter(selected.col)}${selected.row + 1}` : "—"}
+                </span>
+                <div className="h-4 w-px bg-border/60" />
+                <span className="text-xs font-mono text-foreground flex-1 truncate">
+                  {selected ? String(activeSheet.data[selected.row]?.[selected.col] ?? "") : ""}
+                </span>
+              </div>
 
-              {fileStatus === "idle" && (
-                <div className="animate-fade-in">
-                  <div className="w-12 h-12 rounded-2xl bg-secondary mx-auto mb-3 flex items-center justify-center">
-                    <Icon name="FileSpreadsheet" size={24} className="text-muted-foreground" />
-                  </div>
-                  <p className="text-sm font-medium text-foreground mb-1">Перетащи файл сюда или нажми</p>
-                  <p className="text-xs text-muted-foreground">.xlsx · .xls · .csv</p>
-                </div>
-              )}
-
-              {fileStatus === "loading" && (
-                <div className="flex items-center justify-center gap-3 animate-fade-in">
-                  <Icon name="Loader2" size={20} className="text-primary spinner" />
-                  <span className="text-sm text-muted-foreground">Анализирую структуру...</span>
-                </div>
-              )}
-
-              {fileStatus === "error" && (
-                <div className="flex items-center justify-center gap-2 animate-fade-in">
-                  <Icon name="AlertCircle" size={18} className="text-destructive" />
-                  <span className="text-sm text-destructive">Неподдерживаемый формат файла</span>
-                </div>
-              )}
-
-              {fileStatus === "ready" && fileName && (
-                <div className="flex items-center justify-between animate-fade-in">
-                  <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-lg tag-emerald flex items-center justify-center flex-shrink-0">
-                      <Icon name="FileCheck" size={18} />
-                    </div>
-                    <div className="text-left">
-                      <p className="text-sm font-semibold text-foreground">{fileName}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {sheet?.rows.toLocaleString("ru")} строк · {sheet?.cols} колонок
-                      </p>
-                    </div>
-                  </div>
+              {/* Sheet name tabs */}
+              <div className="flex items-center border-b border-border/40 px-2 gap-0.5 flex-shrink-0 overflow-x-auto scrollbar-thin"
+                style={{ background: "rgba(255,255,255,0.01)" }}>
+                {activeFile.sheets.map((sh, si) => (
                   <button
-                    className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setFileStatus("idle");
-                      setSheet(null);
-                      setFileName(null);
-                    }}
-                  >
-                    Заменить
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Sheet tabs */}
-          {fileStatus === "ready" && sheet && (
-            <div className="flex-1 flex flex-col overflow-hidden animate-fade-in">
-              <div className="flex border-b border-border/40 px-4 gap-1">
-                {(["structure", "preview", "stats"] as const).map((tab) => (
-                  <button
-                    key={tab}
-                    onClick={() => setActiveTab(tab)}
-                    className={`px-4 py-3 text-xs font-semibold tracking-wide transition-all border-b-2 -mb-px ${
-                      activeTab === tab
+                    key={si}
+                    onClick={() => setFiles((prev) => prev.map((f) => f.id === activeFileId ? { ...f, activeSheet: si } : f))}
+                    className={`px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-all whitespace-nowrap ${
+                      si === activeFile.activeSheet
                         ? "border-primary text-primary"
                         : "border-transparent text-muted-foreground hover:text-foreground"
                     }`}
                   >
-                    {tab === "structure" && "Структура"}
-                    {tab === "preview" && "Превью данных"}
-                    {tab === "stats" && "Статистика"}
+                    {sh.name}
                   </button>
                 ))}
-                <div className="ml-auto flex items-center">
-                  <span className="text-xs text-muted-foreground font-mono px-2">{sheet.name}</span>
-                </div>
+                <button
+                  onClick={() => {
+                    const name = `Лист${activeFile.sheets.length + 1}`;
+                    setFiles((prev) => prev.map((f) => {
+                      if (f.id !== activeFileId) return f;
+                      const empty = Array.from({ length: 50 }, () => Array(20).fill(null));
+                      const sheets = [...f.sheets, { name, data: empty, colWidths: Array(20).fill(100) }];
+                      return { ...f, sheets, activeSheet: sheets.length - 1, isDirty: true };
+                    }));
+                  }}
+                  className="px-2 py-2 text-xs text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
+                >
+                  <Icon name="Plus" size={13} />
+                </button>
               </div>
+            </>
+          )}
 
-              <div className="flex-1 overflow-y-auto scrollbar-thin p-4">
-                {activeTab === "structure" && (
-                  <div className="space-y-2">
-                    {sheet.columns.map((col, i) => (
-                      <div
-                        key={i}
-                        className="flex items-center gap-3 p-3 rounded-lg border border-border/40 hover:border-border/70 transition-colors"
-                        style={{ background: "rgba(255,255,255,0.02)" }}
-                      >
-                        <span className="text-xs font-mono text-muted-foreground w-6 text-right flex-shrink-0">{i + 1}</span>
-                        <span className="text-sm font-medium text-foreground flex-1 min-w-0 truncate">{col.name}</span>
-                        <span className={`text-xs px-2 py-0.5 rounded-md font-medium flex-shrink-0 ${TYPE_COLORS[col.type] || "tag-blue"}`}>
-                          {col.type}
-                        </span>
-                        <span className="text-xs font-mono text-muted-foreground flex-shrink-0 hidden sm:block w-24 truncate">
-                          {col.sample}
-                        </span>
-                        {col.nulls > 0 && (
-                          <span className="text-xs tag-amber px-2 py-0.5 rounded-md flex-shrink-0">
-                            {col.nulls} пуст.
-                          </span>
-                        )}
-                      </div>
-                    ))}
+          {/* ── Drop zone / empty state ── */}
+          {files.length === 0 && (
+            <div
+              className="flex-1 flex flex-col items-center justify-center gap-6 p-8 cursor-pointer"
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <div className="w-20 h-20 rounded-3xl bg-secondary flex items-center justify-center"
+                style={{ boxShadow: "0 0 60px rgba(52,211,153,0.08)" }}>
+                <Icon name="FileSpreadsheet" size={40} className="text-primary" />
+              </div>
+              <div className="text-center">
+                <p className="text-lg font-semibold text-foreground mb-2">Открой Excel-файл</p>
+                <p className="text-sm text-muted-foreground mb-1">Перетащи один или несколько файлов сюда</p>
+                <p className="text-xs text-muted-foreground">.xlsx · .xls · .csv</p>
+              </div>
+              <div className="grid grid-cols-3 gap-3 max-w-sm text-center">
+                {[
+                  { icon: "Edit3", t: "Редактируй ячейки", d: "Как в Excel" },
+                  { icon: "Layers", t: "Несколько файлов", d: "Все доступны ИИ" },
+                  { icon: "Brain", t: "ИИ-задания", d: "Новые листы автоматом" },
+                ].map((f, i) => (
+                  <div key={i} className="p-3 rounded-xl border border-border/30" style={{ background: "rgba(255,255,255,0.02)" }}>
+                    <Icon name={f.icon} size={18} className="text-primary mx-auto mb-1.5" />
+                    <p className="text-xs font-medium text-foreground">{f.t}</p>
+                    <p className="text-[11px] text-muted-foreground">{f.d}</p>
                   </div>
-                )}
-
-                {activeTab === "preview" && (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs font-mono">
-                      <thead>
-                        <tr>
-                          {sheet.columns.slice(0, 6).map((col) => (
-                            <th key={col.name} className="text-left text-muted-foreground pb-2 pr-4 font-medium whitespace-nowrap">
-                              {col.name}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {[0, 1, 2, 3, 4].map((row) => (
-                          <tr key={row} className="border-t border-border/30">
-                            {sheet.columns.slice(0, 6).map((col) => (
-                              <td key={col.name} className="py-2 pr-4 text-muted-foreground whitespace-nowrap">
-                                {col.sample.split(",")[0]?.trim() || "—"}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    <p className="text-xs text-muted-foreground mt-4 text-center">
-                      Показаны первые 5 строк · 6 из {sheet.cols} колонок
-                    </p>
-                  </div>
-                )}
-
-                {activeTab === "stats" && (
-                  <div className="grid grid-cols-2 gap-3">
-                    {[
-                      { label: "Всего строк", value: sheet.rows.toLocaleString("ru"), icon: "Rows3", color: "text-primary" },
-                      { label: "Колонок", value: String(sheet.cols), icon: "Columns3", color: "text-primary" },
-                      { label: "Листов", value: "1", icon: "Layers", color: "text-amber-400" },
-                      { label: "Заполнены", value: "96.2%", icon: "CheckCircle2", color: "text-primary" },
-                      { label: "Пустых ячеек", value: "433", icon: "AlertCircle", color: "text-amber-400" },
-                      { label: "Тип данных", value: "4 типа", icon: "Tag", color: "text-purple-400" },
-                    ].map((stat, i) => (
-                      <div key={i} className="p-4 rounded-xl border border-border/40 card-glow" style={{ background: "rgba(255,255,255,0.02)" }}>
-                        <div className="flex items-center gap-2 mb-2">
-                          <Icon name={stat.icon} size={15} className={stat.color} />
-                          <span className="text-xs text-muted-foreground">{stat.label}</span>
-                        </div>
-                        <p className="text-2xl font-semibold text-foreground">{stat.value}</p>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                ))}
               </div>
             </div>
           )}
 
-          {/* Empty state */}
-          {fileStatus === "idle" && (
-            <div className="flex-1 flex flex-col items-center justify-center gap-4 p-8 text-center">
-              <div className="grid grid-cols-3 gap-3 max-w-xs">
-                {[
-                  { icon: "FileSearch", label: "Анализ структуры", color: "text-primary" },
-                  { icon: "Brain", label: "ИИ-вопросы", color: "text-amber-400" },
-                  { icon: "BarChart3", label: "Статистика", color: "text-purple-400" },
-                ].map((f, i) => (
-                  <div
-                    key={i}
-                    className="p-3 rounded-xl border border-border/30 text-center"
-                    style={{ background: "rgba(255,255,255,0.02)" }}
-                  >
-                    <Icon name={f.icon} size={20} className={`${f.color} mx-auto mb-2`} />
-                    <p className="text-xs text-muted-foreground">{f.label}</p>
-                  </div>
-                ))}
-              </div>
-              <p className="text-sm text-muted-foreground max-w-xs">
-                Загрузи Excel или CSV-файл, чтобы начать анализ
-              </p>
+          {/* ── Spreadsheet ── */}
+          {activeFile && activeSheet && (
+            <div
+              ref={tableRef}
+              className="flex-1 overflow-auto scrollbar-thin"
+              style={{ background: "hsl(220,16%,5.5%)" }}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}
+            >
+              <table className="border-collapse" style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px" }}>
+                <thead>
+                  <tr>
+                    {/* Row num header */}
+                    <th className="sticky left-0 top-0 z-30 w-10 text-center text-[11px] text-muted-foreground font-normal border-b border-r border-border/50 select-none"
+                      style={{ background: "hsl(220,14%,8%)", minWidth: 40 }} />
+                    {Array.from({ length: visibleCols }, (_, ci) => (
+                      <th
+                        key={ci}
+                        className="sticky top-0 z-20 text-center text-[11px] text-muted-foreground font-medium border-b border-r border-border/50 select-none px-1 py-1"
+                        style={{ background: "hsl(220,14%,8%)", minWidth: activeSheet.colWidths[ci] ?? 100 }}
+                      >
+                        {colLetter(ci)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {Array.from({ length: visibleRows }, (_, ri) => (
+                    <tr key={ri} className="group">
+                      {/* Row number */}
+                      <td className="sticky left-0 z-10 text-center text-[11px] text-muted-foreground border-b border-r border-border/30 select-none px-1"
+                        style={{ background: "hsl(220,14%,8%)", minWidth: 40 }}>
+                        {ri + 1}
+                      </td>
+                      {Array.from({ length: visibleCols }, (_, ci) => {
+                        const isSelected = selected?.row === ri && selected?.col === ci;
+                        const isEditing = editing?.row === ri && editing?.col === ci;
+                        const val = activeSheet.data[ri]?.[ci];
+                        return (
+                          <td
+                            key={ci}
+                            className={`relative border-b border-r border-border/20 px-1.5 py-0.5 cursor-cell select-none transition-colors ${
+                              isSelected
+                                ? "bg-primary/10 outline outline-1 outline-primary z-10"
+                                : "hover:bg-white/[0.02]"
+                            }`}
+                            style={{ minWidth: activeSheet.colWidths[ci] ?? 100, maxWidth: 300, height: 24 }}
+                            onClick={() => { setSelected({ row: ri, col: ci }); setEditing(null); }}
+                            onDoubleClick={() => { setSelected({ row: ri, col: ci }); setEditing({ row: ri, col: ci }); }}
+                          >
+                            {isEditing ? (
+                              <CellEditor
+                                value={val}
+                                onCommit={(v) => { updateCell(ri, ci, v); setEditing(null); setSelected({ row: ri, col: ci + 1 }); }}
+                                onCancel={() => setEditing(null)}
+                              />
+                            ) : (
+                              <span className={`block truncate text-[12px] ${typeof val === "number" ? "text-right text-emerald-300/90" : "text-foreground/90"}`}>
+                                {val !== null && val !== undefined ? String(val) : ""}
+                              </span>
+                            )}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
 
-        {/* Right panel — AI Chat */}
-        <div className="hidden md:flex flex-col flex-1 overflow-hidden">
-          <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full btn-primary flex items-center justify-center flex-shrink-0">
-              <Icon name="Bot" size={16} />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-foreground">ИИ-аналитик</p>
-              <p className="text-xs text-muted-foreground">Задай любой вопрос по данным</p>
-            </div>
-            <div
-              className={`w-2 h-2 rounded-full flex-shrink-0 transition-colors ${
-                aiStatus === "thinking" ? "bg-amber-400" : "bg-primary"
-              }`}
-            />
-          </div>
-
-          <div className="flex-1 overflow-y-auto scrollbar-thin p-5 space-y-4">
-            {messages.map((msg, i) => (
-              <div key={i} className={`flex gap-3 animate-fade-in ${msg.role === "user" ? "flex-row-reverse" : ""}`}>
-                {msg.role === "ai" && (
-                  <div className="w-7 h-7 rounded-full btn-primary flex items-center justify-center flex-shrink-0 mt-0.5">
-                    <Icon name="Sparkles" size={13} />
-                  </div>
-                )}
-                <div
-                  className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
-                    msg.role === "ai"
-                      ? "rounded-tl-sm border border-border/40"
-                      : "btn-amber rounded-tr-sm"
-                  }`}
-                  style={msg.role === "ai" ? { background: "rgba(255,255,255,0.03)" } : {}}
-                >
-                  {msg.role === "ai" ? (
-                    <p dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }} />
-                  ) : (
-                    <p>{msg.text}</p>
-                  )}
-                  <p className={`text-xs mt-1.5 ${msg.role === "ai" ? "text-muted-foreground" : "opacity-60"}`}>
-                    {msg.ts}
-                  </p>
-                </div>
+        {/* ── AI Sidebar ── */}
+        {sidebarOpen && (
+          <div className="w-80 lg:w-96 flex flex-col border-l border-border/60 flex-shrink-0" style={{ background: "hsl(220,14%,7.5%)" }}>
+            {/* Sidebar header */}
+            <div className="px-4 py-3 border-b border-border/40 flex items-center gap-2 flex-shrink-0">
+              <div className="w-7 h-7 rounded-full btn-primary flex items-center justify-center">
+                <Icon name="Bot" size={14} />
               </div>
-            ))}
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-semibold text-foreground">ИИ-аналитик</p>
+                <p className="text-[11px] text-muted-foreground truncate">
+                  {files.length === 0 ? "Нет файлов" : `${files.length} файл(а) загружено`}
+                </p>
+              </div>
+              {aiThinking && <Icon name="Loader2" size={14} className="text-primary spinner flex-shrink-0" />}
+            </div>
 
-            {aiStatus === "thinking" && (
-              <div className="flex gap-3 animate-fade-in">
-                <div className="w-7 h-7 rounded-full btn-primary flex items-center justify-center flex-shrink-0">
-                  <Icon name="Sparkles" size={13} />
-                </div>
-                <div
-                  className="px-4 py-3 rounded-2xl rounded-tl-sm border border-border/40"
-                  style={{ background: "rgba(255,255,255,0.03)" }}
-                >
-                  <div className="flex gap-1.5 items-center h-4">
-                    <span className="w-1.5 h-1.5 rounded-full bg-primary animate-bounce" style={{ animationDelay: "0ms" }} />
-                    <span className="w-1.5 h-1.5 rounded-full bg-primary animate-bounce" style={{ animationDelay: "150ms" }} />
-                    <span className="w-1.5 h-1.5 rounded-full bg-primary animate-bounce" style={{ animationDelay: "300ms" }} />
+            {/* File context pills */}
+            {files.length > 0 && (
+              <div className="px-3 py-2 border-b border-border/30 flex flex-wrap gap-1.5">
+                {files.map((f) => (
+                  <div key={f.id} className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] tag-emerald">
+                    <Icon name="FileSpreadsheet" size={10} />
+                    <span className="max-w-[80px] truncate">{f.name}</span>
                   </div>
+                ))}
+              </div>
+            )}
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-3 space-y-3">
+              {messages.map((msg, i) => (
+                <div key={i} className={`flex gap-2 animate-fade-in ${msg.role === "user" ? "flex-row-reverse" : ""}`}>
+                  {msg.role === "ai" && (
+                    <div className="w-6 h-6 rounded-full btn-primary flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <Icon name="Sparkles" size={11} />
+                    </div>
+                  )}
+                  <div
+                    className={`max-w-[86%] rounded-xl px-3 py-2 text-xs leading-relaxed ${
+                      msg.role === "ai"
+                        ? "rounded-tl-sm border border-border/40"
+                        : "btn-amber rounded-tr-sm"
+                    }`}
+                    style={msg.role === "ai" ? { background: "rgba(255,255,255,0.03)" } : {}}
+                  >
+                    <p dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }} />
+                    <p className={`text-[10px] mt-1 ${msg.role === "ai" ? "text-muted-foreground" : "opacity-50"}`}>{msg.ts}</p>
+                  </div>
+                </div>
+              ))}
+              {aiThinking && (
+                <div className="flex gap-2 animate-fade-in">
+                  <div className="w-6 h-6 rounded-full btn-primary flex items-center justify-center flex-shrink-0">
+                    <Icon name="Sparkles" size={11} />
+                  </div>
+                  <div className="px-3 py-2 rounded-xl rounded-tl-sm border border-border/40" style={{ background: "rgba(255,255,255,0.03)" }}>
+                    <div className="flex gap-1 items-center h-3">
+                      {[0, 150, 300].map((d) => (
+                        <span key={d} className="w-1.5 h-1.5 rounded-full bg-primary animate-bounce" style={{ animationDelay: `${d}ms` }} />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            {/* Quick prompts */}
+            {files.length > 0 && messages.length <= 3 && (
+              <div className="px-3 pb-2">
+                <p className="text-[10px] text-muted-foreground mb-1.5">Примеры заданий:</p>
+                <div className="space-y-1">
+                  {[
+                    "Посчитай итоги по всем числовым столбцам",
+                    "Удали дубликаты строк",
+                    "Возьми формат из образца и примени к основному файлу",
+                  ].map((q) => (
+                    <button
+                      key={q}
+                      onClick={() => setAiInput(q)}
+                      className="w-full text-left text-[11px] px-2.5 py-1.5 rounded-lg border border-border/50 text-muted-foreground hover:text-foreground hover:border-primary/30 transition-all"
+                      style={{ background: "rgba(255,255,255,0.02)" }}
+                    >
+                      {q}
+                    </button>
+                  ))}
                 </div>
               </div>
             )}
-            <div ref={chatEndRef} />
-          </div>
 
-          {messages.length <= 2 && (
-            <div className="px-5 pb-2">
-              <p className="text-xs text-muted-foreground mb-2">Быстрые вопросы:</p>
-              <div className="flex flex-wrap gap-2">
-                {["Какие данные пропущены?", "Посчитай сумму выручки", "Топ менеджеры по продажам"].map((q) => (
-                  <button
-                    key={q}
-                    onClick={() => setInput(q)}
-                    className="text-xs px-3 py-1.5 rounded-full border border-border/60 text-muted-foreground hover:text-foreground hover:border-primary/50 transition-all"
-                    style={{ background: "rgba(255,255,255,0.02)" }}
-                  >
-                    {q}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="p-4 border-t border-border/40">
-            <div className="flex gap-2 items-end">
-              <div className="flex-1 relative">
+            {/* Input */}
+            <div className="p-3 border-t border-border/40 flex-shrink-0">
+              <div className="flex gap-2">
                 <textarea
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSend();
-                    }
-                  }}
-                  placeholder={fileStatus === "ready" ? "Спроси что-нибудь о данных..." : "Сначала загрузи файл..."}
-                  disabled={fileStatus !== "ready"}
-                  rows={1}
-                  className="w-full px-4 py-3 rounded-xl border border-border/60 text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-all disabled:opacity-40"
+                  value={aiInput}
+                  onChange={(e) => setAiInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleAiSend(); } }}
+                  placeholder={files.length === 0 ? "Сначала загрузи файл..." : "Задание для ИИ..."}
+                  disabled={files.length === 0 || aiThinking}
+                  rows={2}
+                  className="flex-1 px-3 py-2 rounded-lg border border-border/60 text-xs text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-primary/50 transition-all disabled:opacity-40"
                   style={{ background: "rgba(255,255,255,0.03)", fontFamily: "'IBM Plex Sans', sans-serif" }}
                 />
+                <button
+                  onClick={handleAiSend}
+                  disabled={!aiInput.trim() || aiThinking || files.length === 0}
+                  className="w-9 h-9 self-end rounded-lg btn-primary flex items-center justify-center flex-shrink-0 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  <Icon name="Send" size={13} />
+                </button>
               </div>
-              <button
-                onClick={handleSend}
-                disabled={!input.trim() || aiStatus === "thinking" || fileStatus !== "ready"}
-                className="w-11 h-11 rounded-xl btn-primary flex items-center justify-center flex-shrink-0 disabled:opacity-30 disabled:cursor-not-allowed"
-                style={{ transform: "none" }}
-              >
-                <Icon name="Send" size={16} />
-              </button>
+              <p className="text-[10px] text-muted-foreground mt-1.5 text-center">Ctrl+S — сохранить · Enter — отправить</p>
             </div>
-            <p className="text-xs text-muted-foreground mt-2 text-center">
-              Enter — отправить · Shift+Enter — новая строка
-            </p>
           </div>
-        </div>
+        )}
       </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".xlsx,.xls,.csv"
+        multiple
+        className="hidden"
+        onChange={(e) => e.target.files && handleFiles(e.target.files)}
+      />
     </div>
   );
 }
