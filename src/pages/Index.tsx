@@ -314,6 +314,8 @@ function sheetToText(sh: SheetData, full = false): string {
 
 // ─── AI Settings ─────────────────────────────────────────────────────────────
 
+const EXCEL_CHART_URL = "https://functions.poehali.dev/8376b365-14fc-4551-9fc7-0798d13ac4e6";
+
 const PRESET_PROVIDERS = [
   { label: "RouterAI (рекомендуется)", baseUrl: "https://routerai.ru/api/v1" },
   { label: "OpenAI (прямой)", baseUrl: "https://api.openai.com/v1" },
@@ -918,6 +920,7 @@ export default function Index() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [aiSettings, setAiSettings] = useState<AiSettings>(loadSettings);
   const [, setAiError] = useState<string | null>(null);
+  const [isListening, setIsListening] = useState(false);
 
   // Сохраняем в window при каждом изменении
   useEffect(() => { window.__datamind_files = files; }, [files]);
@@ -929,6 +932,43 @@ export default function Index() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const tableRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recognitionRef = useRef<any>(null);
+
+  // ── Voice input ──
+  const toggleVoice = useCallback(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Ваш браузер не поддерживает голосовой ввод. Используйте Chrome или Edge.");
+      return;
+    }
+
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+    recognition.lang = "ru-RU";
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.onstart = () => setIsListening(true);
+    recognition.onend = () => setIsListening(false);
+    recognition.onerror = () => setIsListening(false);
+    recognition.onresult = (e: { results: { transcript: string }[][] }) => {
+      const transcript = e.results[0]?.[0]?.transcript ?? "";
+      if (transcript) {
+        setAiInput(prev => prev ? `${prev} ${transcript}` : transcript);
+        textareaRef.current?.focus();
+      }
+    };
+
+    recognition.start();
+  }, [isListening]);
 
   const activeFile = files.find((f) => f.id === activeFileId) ?? null;
   const activeSheet = activeFile ? activeFile.sheets[activeFile.activeSheet] : null;
@@ -1003,11 +1043,59 @@ export default function Index() {
   }, [activeFile]);
 
   // ── Save file ──
-  const saveFile = useCallback((fileId: string) => {
+  const saveFile = useCallback(async (fileId: string) => {
     const f = files.find((ff) => ff.id === fileId);
     if (!f) return;
-    const wb = buildWorkbook(f);
-    XLSX.writeFile(wb, f.name, { bookType: "xlsx", cellStyles: true });
+
+    const chartSheets = f.sheets.filter(sh => sh.chartType);
+
+    if (chartSheets.length > 0) {
+      // Есть листы с графиками — собираем через excel-chart бэкенд
+      // Передаём все листы: оригинальные (из workbook) + новые (от ИИ)
+      const sheetsPayload = f.sheets.map(sh => {
+        const dataRows = sh.cells
+          .filter(r => r.some(c => c.v !== null))
+          .map(r => r.map(c => c.w ?? (c.v !== null ? c.v : null)));
+        return { name: sh.name, data: dataRows };
+      });
+
+      // Для каждого чарт-листа делаем запрос и скачиваем
+      // (берём первый — остальные редкий случай)
+      const firstChart = chartSheets[0];
+      try {
+        const resp = await fetch(EXCEL_CHART_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sheets: sheetsPayload,
+            chart_sheet: firstChart.name,
+            chart_type: firstChart.chartType ?? "pie",
+            chart_title: firstChart.name,
+          }),
+        });
+        if (!resp.ok) throw new Error(`Ошибка ${resp.status}`);
+        const { xlsx_b64 } = await resp.json();
+        const binary = atob(xlsx_b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = f.name;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch {
+        // Если бэкенд недоступен — сохраняем обычным способом
+        const wb = buildWorkbook(f);
+        XLSX.writeFile(wb, f.name, { bookType: "xlsx", cellStyles: true });
+      }
+    } else {
+      // Обычное сохранение — стили сохраняются из оригинального workbook
+      const wb = buildWorkbook(f);
+      XLSX.writeFile(wb, f.name, { bookType: "xlsx", cellStyles: true });
+    }
+
     setFiles((prev) => prev.map((ff) => ff.id === fileId ? { ...ff, isDirty: false } : ff));
   }, [files]);
 
@@ -1499,29 +1587,43 @@ export default function Index() {
 
             {/* Input */}
             <div className="p-3 border-t border-border/40 flex-shrink-0">
-              <div className="flex gap-2">
+              <div className="flex gap-1.5">
                 {/* Image attach button */}
                 <button onClick={() => imageInputRef.current?.click()}
                   title="Прикрепить картинку (или Ctrl+V)"
-                  className="w-9 h-9 self-end rounded-lg bg-secondary text-muted-foreground hover:text-foreground flex items-center justify-center flex-shrink-0 transition-all">
-                  <Icon name="ImagePlus" size={15} />
+                  className="w-8 h-8 self-end rounded-lg bg-secondary text-muted-foreground hover:text-foreground flex items-center justify-center flex-shrink-0 transition-all">
+                  <Icon name="ImagePlus" size={14} />
+                </button>
+                {/* Voice input button */}
+                <button onClick={toggleVoice}
+                  title={isListening ? "Остановить запись" : "Голосовой ввод"}
+                  className={`w-8 h-8 self-end rounded-lg flex items-center justify-center flex-shrink-0 transition-all ${
+                    isListening
+                      ? "bg-red-500/20 text-red-400 border border-red-500/40 animate-pulse"
+                      : "bg-secondary text-muted-foreground hover:text-foreground"
+                  }`}>
+                  <Icon name={isListening ? "MicOff" : "Mic"} size={14} />
                 </button>
                 <textarea ref={textareaRef} value={aiInput}
                   onChange={(e) => setAiInput(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleAiSend(); } }}
-                  placeholder={files.length === 0 ? "Сначала загрузи файл..." : "Задание для ИИ... (Ctrl+V — вставить скриншот)"}
+                  placeholder={isListening ? "🎤 Говорите..." : (files.length === 0 ? "Сначала загрузи файл..." : "Задание для ИИ...")}
                   disabled={aiThinking}
                   rows={2}
-                  className="flex-1 px-3 py-2 rounded-lg border border-border/50 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/40 resize-none transition-all scrollbar-thin"
-                  style={{ background: "rgba(255,255,255,0.03)" }}
+                  className={`flex-1 px-3 py-2 rounded-lg border text-xs text-foreground placeholder:text-muted-foreground focus:outline-none resize-none transition-all scrollbar-thin ${
+                    isListening ? "border-red-500/40 bg-red-500/5" : "border-border/50 focus:border-primary/40"
+                  }`}
+                  style={{ background: isListening ? undefined : "rgba(255,255,255,0.03)" }}
                 />
                 <button onClick={handleAiSend}
                   disabled={(!aiInput.trim() && pendingImages.length === 0) || aiThinking}
-                  className="w-9 h-9 self-end rounded-lg btn-primary flex items-center justify-center flex-shrink-0 disabled:opacity-30 disabled:cursor-not-allowed">
+                  className="w-8 h-8 self-end rounded-lg btn-primary flex items-center justify-center flex-shrink-0 disabled:opacity-30 disabled:cursor-not-allowed">
                   <Icon name="Send" size={13} />
                 </button>
               </div>
-              <p className="text-[10px] text-muted-foreground mt-1.5 text-center">Ctrl+S — сохранить · Enter — отправить · Ctrl+V — вставить скриншот</p>
+              <p className="text-[10px] text-muted-foreground mt-1.5 text-center">
+                Enter — отправить · Ctrl+V — скриншот · 🎤 — голос
+              </p>
             </div>
           </div>
         )}
