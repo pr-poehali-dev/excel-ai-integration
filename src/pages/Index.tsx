@@ -883,6 +883,9 @@ export default function Index() {
   // ── Keyboard navigation ──
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Не перехватываем если фокус в input/textarea/select
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (editing || !selected || !activeSheet) return;
       const { row, col } = selected;
       const maxRow = activeSheet.cells.length - 1;
