@@ -7,7 +7,10 @@ import os
 import json
 from openai import OpenAI
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url="https://api.routerai.ru/v1",
+)
 
 SYSTEM_PROMPT = """Ты — профессиональный аналитик данных и эксперт по Excel.
 Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV-формат), а также задание пользователя.
