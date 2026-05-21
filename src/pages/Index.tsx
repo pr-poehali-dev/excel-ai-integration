@@ -229,12 +229,62 @@ function parseWorkbook(wb: XLSX.WorkBook, name: string, id: string): ExcelFile {
 }
 
 function buildWorkbook(file: ExcelFile): XLSX.WorkBook {
-  const wb = XLSX.utils.book_new();
+  // Клонируем оригинальный workbook — сохраняем все стили, объединения, форматы
+  const origWb = file.workbook;
+  const wb: XLSX.WorkBook = {
+    SheetNames: [...origWb.SheetNames],
+    Sheets: {},
+    Props: origWb.Props,
+  };
+
   file.sheets.forEach((sh) => {
-    const aoa = sh.cells.map(row => row.map(c => c.v));
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    XLSX.utils.book_append_sheet(wb, ws, sh.name);
+    const origWs = origWb.Sheets[sh.name];
+    if (!origWs) {
+      // Новый лист (созданный ИИ) — просто aoa
+      const aoa = sh.cells.map(row => row.map(c => c.v));
+      wb.Sheets[sh.name] = XLSX.utils.aoa_to_sheet(aoa);
+      if (!wb.SheetNames.includes(sh.name)) wb.SheetNames.push(sh.name);
+      return;
+    }
+
+    // Глубокое копирование оригинального листа (все стили сохраняются)
+    const ws: XLSX.WorkSheet = {};
+    for (const key of Object.keys(origWs)) {
+      const val = origWs[key];
+      if (key.startsWith("!")) {
+        ws[key] = val; // метаданные: !ref, !merges, !cols, !rows — копируем как есть
+      } else {
+        // Копируем ячейку — сохраняем все поля включая .s (стиль)
+        ws[key] = { ...val };
+      }
+    }
+
+    // Записываем только изменённые значения, не трогая стили
+    sh.cells.forEach((row, r) => {
+      row.forEach((cd, c) => {
+        const addr = XLSX.utils.encode_cell({ r, c });
+        const origCell = origWs[addr] as XLSX.CellObject | undefined;
+        const origVal = origCell?.v ?? null;
+        if (cd.v === origVal) return; // не изменилось — пропускаем
+
+        if (cd.v === null) {
+          delete ws[addr];
+        } else {
+          const t = typeof cd.v === "number" ? "n" : typeof cd.v === "boolean" ? "b" : "s";
+          ws[addr] = { ...(origCell ?? {}), v: cd.v, t } as XLSX.CellObject;
+        }
+      });
+    });
+
+    // Обновляем !ref под реальный размер данных
+    const range = XLSX.utils.decode_range(ws["!ref"] || "A1");
+    const maxR = Math.max(range.e.r, sh.cells.length - 1);
+    const maxC = Math.max(range.e.c, (sh.cells[0]?.length ?? 1) - 1);
+    ws["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: maxR, c: maxC } });
+
+    wb.Sheets[sh.name] = ws;
   });
+
   return wb;
 }
 
@@ -421,12 +471,19 @@ function detectChartType(sheetName: string): ChartType {
 
 // ─── Real AI call ─────────────────────────────────────────────────────────────
 
+type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?: string; bold?: boolean };
+type CellStyleMutation = { fileId: string; sheetName: string; changes: CellStyleChange[] };
+
 async function callAi(
   prompt: string,
   files: ExcelFile[],
   settings: AiSettings,
   images: ChatImage[]
-): Promise<{ text: string; mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[] }> {
+): Promise<{
+  text: string;
+  mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[];
+  styleMutations?: CellStyleMutation[];
+}> {
   const effectiveModel = settings.model === "__custom__" ? settings.customModel : settings.model;
 
   const filesContext = files.map((f) => ({
@@ -470,7 +527,22 @@ async function callAi(
     }
   }
 
-  return { text: result.text || "Готово!", mutations: mutations.length ? mutations : undefined };
+  // cell_styles: покраска ячеек в существующих листах
+  const styleMutations: CellStyleMutation[] = [];
+  if (result.cell_styles && Array.isArray(result.cell_styles)) {
+    for (const cs of result.cell_styles) {
+      const targetFile = files[cs.file_index ?? 0] ?? files[0];
+      if (targetFile && cs.sheet_name && Array.isArray(cs.changes)) {
+        styleMutations.push({ fileId: targetFile.id, sheetName: cs.sheet_name, changes: cs.changes });
+      }
+    }
+  }
+
+  return {
+    text: result.text || "Готово!",
+    mutations: mutations.length ? mutations : undefined,
+    styleMutations: styleMutations.length ? styleMutations : undefined,
+  };
 }
 
 // ─── Cell Editor ──────────────────────────────────────────────────────────────
@@ -800,7 +872,7 @@ export default function Index() {
     const f = files.find((ff) => ff.id === fileId);
     if (!f) return;
     const wb = buildWorkbook(f);
-    XLSX.writeFile(wb, f.name);
+    XLSX.writeFile(wb, f.name, { bookType: "xlsx", cellStyles: true });
     setFiles((prev) => prev.map((ff) => ff.id === fileId ? { ...ff, isDirty: false } : ff));
   }, [files]);
 
@@ -861,6 +933,68 @@ export default function Index() {
           return next;
         });
         setActiveFileId(firstMut.fileId);
+      }
+
+      // Применяем стили к ячейкам — пишем в cells[] и в оригинальный workbook
+      if (result.styleMutations && result.styleMutations.length > 0) {
+        setFiles((prev) => prev.map((f) => {
+          const sm = result.styleMutations!.filter(s => s.fileId === f.id);
+          if (!sm.length) return f;
+
+          // Обновляем оригинальный workbook (чтобы сохранились при Ctrl+S)
+          const wb = f.workbook;
+          sm.forEach(({ sheetName, changes }) => {
+            const ws = wb.Sheets[sheetName];
+            if (!ws) return;
+            changes.forEach(({ row, col, bgColor, fontColor, bold }) => {
+              const addr = XLSX.utils.encode_cell({ r: row, c: col });
+              const cell = ws[addr] as XLSX.CellObject | undefined;
+              if (!cell) return;
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const s: Record<string, any> = { ...((cell as any).s ?? {}) };
+              if (bgColor) {
+                s.fgColor = { argb: bgColor };
+                s.patType = "solid";
+                s.fill = { type: "pattern", patternType: "solid", fgColor: { argb: bgColor } };
+              }
+              if (fontColor) {
+                s.font = { ...(s.font ?? {}), color: { argb: fontColor } };
+              }
+              if (bold !== undefined) {
+                s.font = { ...(s.font ?? {}), bold };
+              }
+              (cell as XLSX.CellObject & { s: unknown }).s = s;
+            });
+          });
+
+          // Обновляем cells[] для отображения
+          const sheets = f.sheets.map((sh) => {
+            const sm2 = sm.find(s => s.sheetName === sh.name);
+            if (!sm2) return sh;
+            const cells = sh.cells.map(row => [...row]);
+            sm2.changes.forEach(({ row, col, bgColor, fontColor, bold }) => {
+              if (!cells[row]?.[col]) return;
+              const prev = cells[row][col];
+              const newStyle: CellStyle = { ...(prev.s ?? {}) };
+              if (bgColor) newStyle.bgColor = `#${bgColor.slice(2)}`;
+              if (fontColor) newStyle.color = `#${fontColor.slice(2)}`;
+              if (bold !== undefined) newStyle.bold = bold;
+              cells[row][col] = { ...prev, s: newStyle };
+            });
+            return { ...sh, cells };
+          });
+
+          return { ...f, sheets, isDirty: true };
+        }));
+
+        // Переключаемся на нужный лист
+        const firstSm = result.styleMutations[0];
+        setActiveFileId(firstSm.fileId);
+        setFiles((prev) => prev.map((f) => {
+          if (f.id !== firstSm.fileId) return f;
+          const si = f.sheets.findIndex(s => s.name === firstSm.sheetName);
+          return si >= 0 ? { ...f, activeSheet: si } : f;
+        }));
       }
 
       setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime(), chartData, chartTitle }]);
