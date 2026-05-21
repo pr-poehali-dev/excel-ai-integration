@@ -314,8 +314,6 @@ function sheetToText(sh: SheetData, full = false): string {
 
 // ─── AI Settings ─────────────────────────────────────────────────────────────
 
-const BACKEND_URL = "https://functions.poehali.dev/0ca54b20-aea0-424c-8e74-fa9b445c95ba";
-
 const PRESET_PROVIDERS = [
   { label: "RouterAI (рекомендуется)", baseUrl: "https://routerai.ru/api/v1" },
   { label: "OpenAI (прямой)", baseUrl: "https://api.openai.com/v1" },
@@ -485,10 +483,55 @@ function detectChartType(sheetName: string): ChartType {
   return "pie";
 }
 
-// ─── Real AI call ─────────────────────────────────────────────────────────────
+// ─── AI call (direct — no backend, no timeout) ───────────────────────────────
+
+const SYSTEM_PROMPT = `Ты — профессиональный аналитик данных и эксперт по Excel.
+Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV), задание пользователя, и (опционально) изображения — скриншоты графиков, примеры оформления.
+
+КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON и НИЧЕМ КРОМЕ JSON. Никакого текста до или после. Никаких \`\`\`json\`\`\` обёрток.
+
+Формат ответа:
+{
+  "text": "Краткое объяснение что сделано (на русском, 1-3 предложения)",
+  "new_sheet": {
+    "file_index": 0,
+    "sheet_name": "Название_листа",
+    "data": [["Заголовок1","Заголовок2"],["значение1","значение2"]]
+  },
+  "cell_styles": [
+    {
+      "file_index": 0,
+      "sheet_name": "Лист1",
+      "changes": [
+        {"row": 2, "col": 0, "bgColor": "FFFFFF00"}
+      ]
+    }
+  ]
+}
+
+ПРАВИЛА:
+1. "text" — ОБЯЗАТЕЛЬНО всегда
+2. "new_sheet" — только когда нужно создать новый лист с данными/расчётами
+3. "cell_styles" — когда нужно покрасить/форматировать ячейки в СУЩЕСТВУЮЩЕМ листе
+4. row/col в cell_styles — 0-based. Колонка ROW в данных файла — это row-индекс
+5. Чтобы покрасить ВСЕЮ СТРОКУ — укажи изменения для каждой колонки строки (col: 0, 1, 2, ... до последней колонки с данными)
+6. bgColor — AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, голубой=FF00B0F0
+7. fontColor — AARRGGBB цвет текста
+8. bold: true/false
+9. Числа в data — числа, текст — строки
+10. Если просят покрасить строки — cell_styles, НЕ новый лист
+11. Изображение — используй как образец структуры/оформления`;
 
 type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?: string; bold?: boolean };
 type CellStyleMutation = { fileId: string; sheetName: string; changes: CellStyleChange[] };
+
+function extractJson(raw: string): Record<string, unknown> {
+  raw = raw.trim().replace(/^```(?:json)?\s*/m, "").replace(/\s*```$/m, "").trim();
+  try { return JSON.parse(raw); } catch { /* fall through */ }
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch { /* fall through */ } }
+  return { text: raw || "ИИ вернул пустой ответ" };
+}
 
 async function callAi(
   prompt: string,
@@ -501,60 +544,75 @@ async function callAi(
   styleMutations?: CellStyleMutation[];
 }> {
   const effectiveModel = settings.model === "__custom__" ? settings.customModel : settings.model;
+  const baseUrl = settings.baseUrl.replace(/\/$/, "");
 
-  const filesContext = files.map((f) => ({
-    name: f.name,
-    role: f.role,
-    sheets: f.sheets.map((sh, si) => {
+  // Строим контекст файлов
+  const contextParts: string[] = [];
+  files.forEach((f, fi) => {
+    const roleLabel = f.role === "main" ? " [ОСНОВНОЙ]" : f.role === "reference" ? " [ОБРАЗЕЦ]" : "";
+    contextParts.push(`=== Файл ${fi} «${f.name}»${roleLabel} ===`);
+    f.sheets.forEach((sh, si) => {
       const isActive = si === f.activeSheet;
-      return {
-        name: sh.name,
-        active: isActive,
-        total_rows: sh.cells.filter(r => r.some(c => c.v !== null)).length,
-        preview: sheetToText(sh, isActive), // активный — полный, остальные — только шапка
-      };
-    }),
-  }));
+      const totalRows = sh.cells.filter(r => r.some(c => c.v !== null)).length;
+      const marker = isActive ? " [АКТИВНЫЙ — полные данные]" : ` [краткий просмотр, всего ${totalRows} строк]`;
+      contextParts.push(`--- Лист «${sh.name}»${marker} ---`);
+      contextParts.push(sheetToText(sh, isActive));
+    });
+  });
 
-  const imagesB64 = images.map(img => ({
-    name: img.name,
-    data: img.dataUrl.split(",")[1] ?? "",
-    mime: img.dataUrl.split(";")[0].split(":")[1] ?? "image/png",
-  }));
+  const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${contextParts.join("\n")}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}\n\nОтветь ТОЛЬКО JSON.`;
 
-  const resp = await fetch(BACKEND_URL, {
+  // Строим сообщение (с картинками или без)
+  type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+  let userContent: string | ContentPart[];
+  if (images.length > 0) {
+    userContent = [{ type: "text", text: textBlock } as ContentPart];
+    for (const img of images) {
+      (userContent as ContentPart[]).push({
+        type: "image_url",
+        image_url: { url: img.dataUrl },
+      });
+    }
+  } else {
+    userContent = textBlock;
+  }
+
+  const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${settings.apiKey}`,
+    },
     body: JSON.stringify({
-      prompt,
-      files_context: filesContext,
-      api_key: settings.apiKey,
-      base_url: settings.baseUrl,
       model: effectiveModel,
-      images: imagesB64.length ? imagesB64 : undefined,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userContent },
+      ],
+      max_tokens: 4000,
+      temperature: 0.1,
     }),
   });
 
   if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error((err as { error?: string }).error || `Ошибка ${resp.status}`);
+    const err = await resp.json().catch(() => ({})) as { error?: { message?: string } };
+    throw new Error(err.error?.message || `Ошибка ${resp.status}`);
   }
 
-  const result = await resp.json();
+  const json = await resp.json() as { choices: { message: { content: string } }[] };
+  const raw = json.choices?.[0]?.message?.content ?? "{}";
+  const result = extractJson(raw);
 
   const mutations: { fileId: string; sheetName: string; data: CellValue[][] }[] = [];
   if (result.new_sheet) {
-    const ns = result.new_sheet;
+    const ns = result.new_sheet as { file_index?: number; sheet_name: string; data: CellValue[][] };
     const targetFile = files[ns.file_index ?? 0] ?? files[0];
-    if (targetFile) {
-      mutations.push({ fileId: targetFile.id, sheetName: ns.sheet_name, data: ns.data });
-    }
+    if (targetFile) mutations.push({ fileId: targetFile.id, sheetName: ns.sheet_name, data: ns.data });
   }
 
-  // cell_styles: покраска ячеек в существующих листах
   const styleMutations: CellStyleMutation[] = [];
-  if (result.cell_styles && Array.isArray(result.cell_styles)) {
-    for (const cs of result.cell_styles) {
+  if (Array.isArray(result.cell_styles)) {
+    for (const cs of result.cell_styles as { file_index?: number; sheet_name: string; changes: CellStyleChange[] }[]) {
       const targetFile = files[cs.file_index ?? 0] ?? files[0];
       if (targetFile && cs.sheet_name && Array.isArray(cs.changes)) {
         styleMutations.push({ fileId: targetFile.id, sheetName: cs.sheet_name, changes: cs.changes });
@@ -563,7 +621,7 @@ async function callAi(
   }
 
   return {
-    text: result.text || "Готово!",
+    text: (result.text as string) || "Готово!",
     mutations: mutations.length ? mutations : undefined,
     styleMutations: styleMutations.length ? styleMutations : undefined,
   };
