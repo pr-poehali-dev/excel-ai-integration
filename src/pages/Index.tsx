@@ -576,10 +576,13 @@ export default function Index() {
         {/* File tabs */}
         <div className="flex items-center gap-1 flex-1 overflow-x-auto scrollbar-thin min-w-0">
           {files.map((f) => (
-            <button
+            <div
               key={f.id}
+              role="button"
+              tabIndex={0}
               onClick={() => { setActiveFileId(f.id); setEditing(null); setSelected(null); }}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all ${
+              onKeyDown={(e) => { if (e.key === "Enter") { setActiveFileId(f.id); setEditing(null); setSelected(null); } }}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all cursor-pointer ${
                 f.id === activeFileId
                   ? "bg-primary/10 text-primary border border-primary/30"
                   : "text-muted-foreground hover:text-foreground hover:bg-secondary"
@@ -599,7 +602,7 @@ export default function Index() {
               >
                 <Icon name="X" size={11} />
               </button>
-            </button>
+            </div>
           ))}
           <button
             onClick={() => fileInputRef.current?.click()}
