@@ -330,19 +330,22 @@ const PRESET_MODELS = [
   { label: "Gemini 2.0 Flash", value: "google/gemini-2.0-flash-001" },
 ];
 
+type ReasoningEffort = "none" | "low" | "medium" | "high";
+
 interface AiSettings {
   apiKey: string;
   baseUrl: string;
   model: string;
   customModel: string;
+  reasoningEffort: ReasoningEffort;
 }
 
 function loadSettings(): AiSettings {
   try {
     const s = localStorage.getItem("datamind_ai_settings");
-    if (s) return JSON.parse(s);
+    if (s) return { reasoningEffort: "none", ...JSON.parse(s) };
   } catch (e) { void e; }
-  return { apiKey: "", baseUrl: "https://routerai.ru/api/v1", model: "deepseek/deepseek-chat", customModel: "" };
+  return { apiKey: "", baseUrl: "https://routerai.ru/api/v1", model: "deepseek/deepseek-chat", customModel: "", reasoningEffort: "none" };
 }
 
 function saveSettings(s: AiSettings) {
@@ -460,6 +463,36 @@ function SettingsModal({ settings, onChange, onClose }: SettingsModalProps) {
                 className="mt-2 w-full px-3 py-2 rounded-lg border border-border/50 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 font-mono"
                 style={{ background: "rgba(255,255,255,0.03)" }} />
             )}
+          </div>
+
+          {/* Reasoning effort */}
+          <div>
+            <label className="text-xs text-muted-foreground mb-1.5 block font-medium">Время размышления</label>
+            <div className="grid grid-cols-4 gap-1.5">
+              {([
+                { value: "none",   label: "Выкл",    desc: "Быстрее всего, без раздумий" },
+                { value: "low",    label: "Низкое",  desc: "Лёгкие задачи" },
+                { value: "medium", label: "Среднее", desc: "Баланс скорости и качества" },
+                { value: "high",   label: "Высокое", desc: "Сложный анализ, медленнее" },
+              ] as { value: ReasoningEffort; label: string; desc: string }[]).map(opt => (
+                <button key={opt.value} onClick={() => update({ reasoningEffort: opt.value })}
+                  title={opt.desc}
+                  className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all border ${
+                    local.reasoningEffort === opt.value
+                      ? "border-primary/50 bg-primary/10 text-primary"
+                      : "border-border/40 text-muted-foreground hover:text-foreground hover:border-border"
+                  }`}
+                  style={{ background: local.reasoningEffort === opt.value ? undefined : "rgba(255,255,255,0.02)" }}>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-muted-foreground mt-1.5">
+              {local.reasoningEffort === "none"   && "Модель отвечает без предварительного анализа — быстро, но может ошибаться на сложных задачах."}
+              {local.reasoningEffort === "low"    && "Краткое обдумывание. Подходит для простых запросов — суммы, фильтрация, переименование."}
+              {local.reasoningEffort === "medium" && "Оптимальный режим для большинства задач — анализ данных, поиск по условию, покраска ячеек."}
+              {local.reasoningEffort === "high"   && "Глубокий анализ. Нужен для сложной логики, большого количества условий. Ответ занимает больше времени."}
+            </p>
           </div>
         </div>
 
@@ -591,8 +624,8 @@ async function callAi(
       ],
       max_tokens: 4000,
       temperature: 0.1,
-      ...(effectiveModel.includes("r1") || effectiveModel.includes("think")
-        ? { reasoning_effort: "medium" }
+      ...(settings.reasoningEffort !== "none"
+        ? { reasoning_effort: settings.reasoningEffort }
         : {}),
     }),
   });
