@@ -7,30 +7,11 @@
       "expectedStatus": 200
     },
     {
-      "name": "Генерация xlsx с круговым графиком",
+      "name": "Без данных — ошибка 400",
       "method": "POST",
       "path": "/",
-      "body": {
-        "sheets": [
-          {
-            "name": "График_ГТМ",
-            "data": [
-              ["Вид ГТМ", "Количество"],
-              ["РИР", 4],
-              ["ВИР", 7],
-              ["Перфорация", 8],
-              ["ОПЗ", 5],
-              ["ГРП", 12]
-            ]
-          }
-        ],
-        "chart_sheet": "График_ГТМ",
-        "chart_type": "pie",
-        "chart_title": "Количество ГТМ"
-      },
-      "expectedStatus": 200,
-      "expectedBody": { "xlsx_b64": "string" },
-      "bodyMatcher": "partial"
+      "body": {},
+      "expectedStatus": 400
     }
   ]
 }

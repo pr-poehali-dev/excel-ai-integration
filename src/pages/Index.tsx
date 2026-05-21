@@ -1050,35 +1050,36 @@ export default function Index() {
     const chartSheets = f.sheets.filter(sh => sh.chartType);
 
     if (chartSheets.length > 0) {
-      // Есть листы с графиками — собираем через excel-chart бэкенд
-      // Передаём все листы: оригинальные (из workbook) + новые (от ИИ)
-      const sheetsPayload = f.sheets.map(sh => {
-        const dataRows = sh.cells
-          .filter(r => r.some(c => c.v !== null))
-          .map(r => r.map(c => c.w ?? (c.v !== null ? c.v : null)));
-        return { name: sh.name, data: dataRows };
-      });
-
-      // Для каждого чарт-листа делаем запрос и скачиваем
-      // (берём первый — остальные редкий случай)
-      const firstChart = chartSheets[0];
+      // Есть листы с графиками — сначала собираем полный xlsx со всеми стилями,
+      // затем отправляем его на бэкенд который добавляет диаграмму не трогая остальное
       try {
+        const wb = buildWorkbook(f);
+        // Сериализуем в Uint8Array и кодируем в base64
+        const wbOut = XLSX.write(wb, { bookType: "xlsx", type: "array", cellStyles: true }) as ArrayBuffer;
+        const bytes = new Uint8Array(wbOut);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const xlsxB64 = btoa(binary);
+
+        const firstChart = chartSheets[0];
         const resp = await fetch(EXCEL_CHART_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            sheets: sheetsPayload,
+            xlsx_b64: xlsxB64,
             chart_sheet: firstChart.name,
             chart_type: firstChart.chartType ?? "pie",
             chart_title: firstChart.name,
           }),
         });
+
         if (!resp.ok) throw new Error(`Ошибка ${resp.status}`);
-        const { xlsx_b64 } = await resp.json();
-        const binary = atob(xlsx_b64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        const blob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+        const { xlsx_b64: resultB64 } = await resp.json();
+
+        const resBinary = atob(resultB64);
+        const resBytes = new Uint8Array(resBinary.length);
+        for (let i = 0; i < resBinary.length; i++) resBytes[i] = resBinary.charCodeAt(i);
+        const blob = new Blob([resBytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
@@ -1086,7 +1087,7 @@ export default function Index() {
         a.click();
         URL.revokeObjectURL(url);
       } catch {
-        // Если бэкенд недоступен — сохраняем обычным способом
+        // Fallback — сохраняем без графика но со стилями
         const wb = buildWorkbook(f);
         XLSX.writeFile(wb, f.name, { bookType: "xlsx", cellStyles: true });
       }

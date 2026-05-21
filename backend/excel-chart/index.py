@@ -1,16 +1,15 @@
 """
-Генерирует xlsx-файл с данными + встроенной диаграммой через openpyxl.
-Принимает: sheets (все листы файла), chart_sheet (имя листа с данными для графика), chart_type.
-Возвращает base64-encoded xlsx.
+Добавляет лист с диаграммой в существующий xlsx-файл через openpyxl.
+Принимает: xlsx_b64 (оригинальный файл), chart_sheet (имя листа с данными), chart_type.
+Возвращает base64-encoded xlsx с добавленным графиком.
 """
 
 import json
 import base64
 import io
-from openpyxl import Workbook
+from openpyxl import load_workbook
 from openpyxl.chart import PieChart, BarChart, LineChart, Reference
 from openpyxl.chart.series import DataPoint
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 
@@ -19,26 +18,9 @@ CHART_COLORS = [
     "F87171", "2DD4BF", "FB923C", "818CF8",
 ]
 
-THIN = Side(style="thin", color="2D3748")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-
-
-def style_header_cell(cell):
-    cell.font = Font(bold=True, color="FFFFFF", size=10)
-    cell.fill = PatternFill("solid", fgColor="1A202C")
-    cell.alignment = Alignment(horizontal="center", vertical="center")
-    cell.border = BORDER
-
-
-def style_data_cell(cell, row_idx: int):
-    cell.alignment = Alignment(horizontal="left", vertical="center")
-    cell.border = BORDER
-    if row_idx % 2 == 0:
-        cell.fill = PatternFill("solid", fgColor="1E2A3A")
-
 
 def handler(event: dict, context) -> dict:
-    """Генерация Excel-файла со встроенным графиком"""
+    """Добавляет диаграмму в существующий xlsx не трогая другие листы и стили"""
 
     if event.get("httpMethod") == "OPTIONS":
         return {
@@ -53,101 +35,89 @@ def handler(event: dict, context) -> dict:
         }
 
     body = json.loads(event.get("body") or "{}")
-    sheets_data = body.get("sheets", [])       # [{name, data: [[...],...]}]
-    chart_sheet_name = body.get("chart_sheet") # имя листа с данными для графика
-    chart_type = body.get("chart_type", "pie") # pie | bar | line
+    xlsx_b64 = body.get("xlsx_b64")          # base64 оригинального файла
+    chart_sheet_name = body.get("chart_sheet")  # имя листа с данными для графика
+    chart_type = body.get("chart_type", "pie")  # pie | bar | line
     chart_title = body.get("chart_title", "График")
 
-    if not sheets_data:
+    if not xlsx_b64 or not chart_sheet_name:
         return {
             "statusCode": 400,
             "headers": {"Access-Control-Allow-Origin": "*"},
-            "body": json.dumps({"error": "Нет данных"}, ensure_ascii=False),
+            "body": json.dumps({"error": "Нужны xlsx_b64 и chart_sheet"}, ensure_ascii=False),
         }
 
-    wb = Workbook()
-    wb.remove(wb.active)  # удаляем дефолтный пустой лист
+    # Загружаем оригинальный файл — все стили, форматы, объединения сохраняются
+    try:
+        raw = base64.b64decode(xlsx_b64)
+        wb = load_workbook(io.BytesIO(raw))
+    except Exception as e:
+        return {
+            "statusCode": 400,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"error": f"Ошибка чтения файла: {e}"}, ensure_ascii=False),
+        }
 
-    chart_ws = None
+    # Находим лист с данными для графика
+    if chart_sheet_name not in wb.sheetnames:
+        return {
+            "statusCode": 400,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"error": f"Лист «{chart_sheet_name}» не найден"}, ensure_ascii=False),
+        }
 
-    for sh in sheets_data:
-        ws = wb.create_sheet(title=str(sh["name"])[:31])
-        rows = sh.get("data", [])
+    chart_ws = wb[chart_sheet_name]
+    data_rows = chart_ws.max_row
+    data_cols = chart_ws.max_column
 
-        for ri, row in enumerate(rows):
-            for ci, val in enumerate(row):
-                if val is None:
-                    continue
-                cell = ws.cell(row=ri + 1, column=ci + 1, value=val)
-                if ri == 0:
-                    style_header_cell(cell)
-                else:
-                    style_data_cell(cell, ri)
+    if data_rows < 2 or data_cols < 2:
+        return {
+            "statusCode": 400,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"error": "Недостаточно данных для графика (нужно минимум 2 строки и 2 колонки)"}, ensure_ascii=False),
+        }
 
-        # Авто-ширина колонок
-        for col_cells in ws.columns:
-            max_len = 0
-            col_letter = get_column_letter(col_cells[0].column)
-            for cell in col_cells:
-                if cell.value:
-                    max_len = max(max_len, len(str(cell.value)))
-            ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
+    # Метки (первая колонка, строки 2..N)
+    labels = Reference(chart_ws, min_col=1, min_row=2, max_row=data_rows)
+    # Значения (вторая колонка, строки 1..N — заголовок + данные)
+    values = Reference(chart_ws, min_col=2, min_row=1, max_row=data_rows)
 
-        ws.row_dimensions[1].height = 20
+    if chart_type == "pie":
+        chart = PieChart()
+        chart.title = chart_title
+        chart.style = 10
+        chart.add_data(values, titles_from_data=True)
+        chart.set_categories(labels)
+        # Раскрашиваем сегменты
+        series = chart.series[0]
+        for idx in range(data_rows - 1):
+            pt = DataPoint(idx=idx)
+            pt.graphicalProperties.solidFill = CHART_COLORS[idx % len(CHART_COLORS)]
+            series.dPt.append(pt)
 
-        if sh["name"] == chart_sheet_name:
-            chart_ws = ws
+    elif chart_type == "bar":
+        chart = BarChart()
+        chart.type = "col"
+        chart.title = chart_title
+        chart.style = 10
+        chart.add_data(values, titles_from_data=True)
+        chart.set_categories(labels)
 
-    # Строим диаграмму на нужном листе
-    if chart_ws is not None:
-        data_rows = chart_ws.max_row
-        data_cols = chart_ws.max_column
+    else:
+        chart = LineChart()
+        chart.title = chart_title
+        chart.style = 10
+        chart.add_data(values, titles_from_data=True)
+        chart.set_categories(labels)
 
-        if data_rows >= 2 and data_cols >= 2:
-            # Метки (первая колонка, строки 2..N)
-            labels = Reference(chart_ws, min_col=1, min_row=2, max_row=data_rows)
-            # Значения (вторая колонка, строки 2..N)
-            values = Reference(chart_ws, min_col=2, min_row=1, max_row=data_rows)
+    chart.width = 18
+    chart.height = 12
 
-            if chart_type == "pie":
-                chart = PieChart()
-                chart.title = chart_title
-                chart.style = 10
-                chart.add_data(values, titles_from_data=True)
-                chart.set_categories(labels)
-                chart.dataLabels = None
+    # Добавляем график правее данных на том же листе
+    anchor_col = get_column_letter(data_cols + 2)
+    chart_ws.add_chart(chart, f"{anchor_col}2")
 
-                # Раскрашиваем сегменты
-                series = chart.series[0]
-                for idx in range(data_rows - 1):
-                    pt = DataPoint(idx=idx)
-                    color = CHART_COLORS[idx % len(CHART_COLORS)]
-                    pt.graphicalProperties.solidFill = color
-                    series.dPt.append(pt)
-
-            elif chart_type == "bar":
-                chart = BarChart()
-                chart.type = "col"
-                chart.title = chart_title
-                chart.style = 10
-                chart.add_data(values, titles_from_data=True)
-                chart.set_categories(labels)
-
-            else:
-                chart = LineChart()
-                chart.title = chart_title
-                chart.style = 10
-                chart.add_data(values, titles_from_data=True)
-                chart.set_categories(labels)
-
-            chart.width = 18
-            chart.height = 12
-
-            # Добавляем график на тот же лист, правее данных
-            anchor_col = get_column_letter(data_cols + 2)
-            chart_ws.add_chart(chart, f"{anchor_col}2")
-
-    # Сохраняем в bytes
+    # Сохраняем — оригинальные листы и стили не тронуты
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
