@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import * as XLSX from "xlsx";
 import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid } from "recharts";
 import Icon from "@/components/ui/icon";
@@ -923,6 +924,7 @@ export default function Index() {
   const [aiThinking, setAiThinking] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const navigate = useNavigate();
   const [aiSettings, setAiSettings] = useState<AiSettings>(loadSettings);
   const [, setAiError] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
@@ -1362,6 +1364,12 @@ export default function Index() {
             <span className="hidden lg:inline max-w-[100px] truncate">
               {aiSettings.apiKey ? effectiveModelLabel : "Нет ключа"}
             </span>
+          </button>
+          <button onClick={() => navigate("/oilfield")}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all border border-border/40"
+            title="Анализ месторождений">
+            <Icon name="BarChart2" size={14} />
+            <span className="hidden sm:inline">Месторождения</span>
           </button>
           <button onClick={() => setSidebarOpen(p => !p)}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all">

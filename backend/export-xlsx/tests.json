@@ -1,0 +1,19 @@
+{
+  "tests": [
+    {
+      "name": "OPTIONS preflight",
+      "method": "OPTIONS",
+      "path": "/",
+      "expectedStatus": 200
+    },
+    {
+      "name": "Export default xlsx",
+      "method": "POST",
+      "path": "/",
+      "body": {"field_name": "Тестовое", "years": [2022, 2023, 2024]},
+      "expectedStatus": 200,
+      "expectedBody": {"file": "string"},
+      "bodyMatcher": "partial"
+    }
+  ]
+}
