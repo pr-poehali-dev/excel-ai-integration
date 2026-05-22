@@ -578,7 +578,12 @@ async function callAi(
   mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[];
   styleMutations?: CellStyleMutation[];
 }> {
-  const effectiveModel = settings.model === "__custom__" ? settings.customModel : settings.model;
+  const selectedModel = settings.model === "__custom__" ? settings.customModel : settings.model;
+  // Модели без поддержки vision — при наличии картинок автоматически переключаем на gpt-4o-mini
+  const VISION_UNSUPPORTED = ["deepseek/deepseek-chat", "deepseek/deepseek-r1"];
+  const effectiveModel = (images.length > 0 && VISION_UNSUPPORTED.includes(selectedModel))
+    ? "openai/gpt-4o-mini"
+    : selectedModel;
   const baseUrl = settings.baseUrl.replace(/\/$/, "");
 
   // Строим контекст файлов
