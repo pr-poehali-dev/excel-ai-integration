@@ -369,6 +369,11 @@ function sheetToText(sh: SheetData, full = false): string {
         const short = ownerVal.length > 20 ? ownerVal.slice(0, 20) + "…" : ownerVal;
         return `[merged:«${short}»]`;
       }
+      // Для числовых ячеек показываем сырое число (для корректного сравнения в ИИ)
+      // и форматированное значение через |
+      if (typeof c.v === "number" && c.w && c.w !== String(c.v)) {
+        return `${c.v}|${c.w}`;
+      }
       const s = c.w ?? (c.v !== null ? String(c.v) : "");
       return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…" : s;
     }).join("\t");
@@ -622,14 +627,23 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
 1. "text" — ОБЯЗАТЕЛЬНО всегда
 2. "new_sheet" — только когда нужно создать новый лист с данными/расчётами
 3. "cell_styles" — когда нужно покрасить/форматировать ячейки в СУЩЕСТВУЮЩЕМ листе
-4. row/col в cell_styles — 0-based. Колонка ROW в данных файла — это row-индекс
-5. Чтобы покрасить ВСЕЮ СТРОКУ — укажи изменения для каждой колонки строки (col: 0, 1, 2, ... до последней колонки с данными)
-6. bgColor — AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, голубой=FF00B0F0
-7. fontColor — AARRGGBB цвет текста
-8. bold: true/false
-9. Числа в data — числа, текст — строки
-10. Если просят покрасить строки — cell_styles, НЕ новый лист
-11. Изображение — используй как образец структуры/оформления
+4. row/col в cell_styles — СТРОГО 0-based. Значение из колонки ROW в таблице данных = это и есть row. Например строка с ROW=15 → row:15
+5. col — тоже 0-based: A=0, B=1, C=2, ... N=13, O=14, P=15, Q=16 и т.д.
+6. Чтобы покрасить ячейку в НЕСКОЛЬКИХ столбцах одной строки — перечисли отдельную запись для каждого col
+7. bgColor — AARRGGBB (8 символов!): жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, голубой=FF00B0F0, розовый=FFFFC0CB
+8. fontColor — AARRGGBB цвет текста
+9. bold: true/false
+10. Числа в data — числа, текст — строки
+11. Если просят покрасить строки/ячейки — cell_styles, НЕ новый лист
+12. Изображение — используй как образец структуры/оформления
+13. ВАЖНО при работе с условиями (менее/более X): проверяй ЧИСЛОВОЕ значение ячейки из данных, не форматированный текст. Перебери ВСЕ строки с данными последовательно
+
+АЛГОРИТМ ДЛЯ ЗАДАЧ "ВЫДЕЛИ ЯЧЕЙКИ ГДЕ ЗНАЧЕНИЕ < X":
+1. Определи нужный столбец по иерархии заголовков (из секции ИЕРАРХИЯ ЗАГОЛОВКОВ)
+2. Пройди по всем строкам данных (ROW N..M)
+3. Для каждой строки: прочитай значение ячейки в нужном col
+4. Если значение < X (или соответствует условию) — добавь запись в changes: {"row": N, "col": C, "bgColor": "FFFFA500"}
+5. Верни ВСЕ подходящие строки, не только первую
 
 КАК ЧИТАТЬ ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ (MERGES):
 В данных файла ячейки помечены специально:
@@ -755,7 +769,29 @@ async function callAi(
     for (const cs of result.cell_styles as { file_index?: number; sheet_name: string; changes: CellStyleChange[] }[]) {
       const targetFile = files[cs.file_index ?? 0] ?? files[0];
       if (targetFile && cs.sheet_name && Array.isArray(cs.changes)) {
-        styleMutations.push({ fileId: targetFile.id, sheetName: cs.sheet_name, changes: cs.changes });
+        // Находим лист чтобы знать реальный размер — для проверки row/col
+        const targetSheet = targetFile.sheets.find(s => s.name === cs.sheet_name);
+        const maxRows = targetSheet?.cells.length ?? 9999;
+        const maxCols = targetSheet?.cells[0]?.length ?? 9999;
+
+        const safeChanges = cs.changes
+          .filter(ch => {
+            const r = ch.row;
+            const c = ch.col;
+            // Отбрасываем явно невалидные (отрицательные)
+            return typeof r === "number" && typeof c === "number" && r >= 0 && c >= 0;
+          })
+          .map(ch => {
+            let { row, col } = ch;
+            // Если ИИ передал 1-based (row > maxRows но row-1 < maxRows) — корректируем
+            if (row >= maxRows && row - 1 < maxRows) row = row - 1;
+            if (col >= maxCols && col - 1 < maxCols) col = col - 1;
+            return { ...ch, row, col };
+          });
+
+        if (safeChanges.length > 0) {
+          styleMutations.push({ fileId: targetFile.id, sheetName: cs.sheet_name, changes: safeChanges });
+        }
       }
     }
   }
@@ -1310,12 +1346,25 @@ export default function Index() {
             if (!sm2) return sh;
             const cells = sh.cells.map(row => [...row]);
             sm2.changes.forEach(({ row, col, bgColor, fontColor, bold }) => {
-              if (!cells[row]) return;
-              if (!cells[row][col]) cells[row][col] = { v: null };
-              const prev = cells[row][col];
+              // Расширяем массив если ИИ указал строку за пределами
+              if (row >= cells.length) {
+                const colCount = cells[0]?.length ?? 30;
+                while (cells.length <= row) cells.push(Array.from({ length: colCount }, () => ({ v: null })));
+              }
+              if (col >= cells[row].length) {
+                while (cells[row].length <= col) cells[row].push({ v: null });
+              }
+              const prev = cells[row][col] ?? { v: null };
               const newStyle: CellStyle = { ...(prev.s ?? {}) };
-              if (bgColor) newStyle.bgColor = `#${bgColor.slice(2)}`;
-              if (fontColor) newStyle.color = `#${fontColor.slice(2)}`;
+              if (bgColor) {
+                // Поддерживаем форматы: AARRGGBB (8 символов) и RRGGBB (6 символов)
+                const hex = bgColor.length === 8 ? bgColor.slice(2) : bgColor.length === 6 ? bgColor : bgColor.replace(/^#/, "");
+                newStyle.bgColor = `#${hex}`;
+              }
+              if (fontColor) {
+                const hex = fontColor.length === 8 ? fontColor.slice(2) : fontColor.length === 6 ? fontColor : fontColor.replace(/^#/, "");
+                newStyle.color = `#${hex}`;
+              }
               if (bold !== undefined) newStyle.bold = bold;
               cells[row][col] = { ...prev, s: newStyle };
             });
