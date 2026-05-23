@@ -290,8 +290,23 @@ function buildWorkbook(file: ExcelFile): XLSX.WorkBook {
 }
 
 // Полный текст листа с номерами строк (для активного листа)
-// Возвращает координаты хозяина объединённой ячейки (верхний левый угол).
-// Если ячейка сама хозяин — null.
+// Excel-адрес ячейки: (0,0) → "A1", (12, 13) → "N13"  (строки 1-based как в Excel)
+function cellAddr(row: number, col: number): string {
+  return `${colLetter(col)}${row + 1}`;
+}
+
+// Реальная ширина листа
+function getRealColCount(sh: SheetData): number {
+  let maxC = 0;
+  sh.cells.forEach(row => {
+    row.forEach((c, ci) => { if (c.v !== null) maxC = Math.max(maxC, ci + 1); });
+  });
+  sh.merges.forEach(m => { maxC = Math.max(maxC, m.c2 + 1); });
+  return Math.min(maxC + 1, 60);
+}
+
+// Если ячейка входит в объединение — возвращает координаты хозяина (верхний левый угол).
+// Если сама хозяин или не в объединении — null.
 function getMergeOwner(sh: SheetData, r: number, c: number): { r: number; c: number } | null {
   for (const m of sh.merges) {
     if (r >= m.r1 && r <= m.r2 && c >= m.c1 && c <= m.c2) {
@@ -302,29 +317,13 @@ function getMergeOwner(sh: SheetData, r: number, c: number): { r: number; c: num
   return null;
 }
 
-// Реальная ширина листа (до 60 столбцов)
-function getRealColCount(sh: SheetData): number {
-  let maxC = 0;
-  sh.cells.forEach(row => {
-    row.forEach((c, ci) => { if (c.v !== null) maxC = Math.max(maxC, ci + 1); });
-  });
-  sh.merges.forEach(m => { maxC = Math.max(maxC, m.c2 + 1); });
-  return Math.min(maxC + 1, 60);
-}
-
-// Определяет последнюю строку зоны заголовков.
-// Логика: последняя строка которая ПОЛНОСТЬЮ входит хотя бы в одно объединение
-// (= строка заголовков, а не данных).
-// Если объединений нет — ищем первую строку, ГДЕ БОЛЬШИНСТВО непустых ячеек — числа.
+// Последняя строка зоны заголовков = нижняя граница самого нижнего объединения.
+// Если объединений нет — первая строка где >50% непустых ячеек числовые, минус 1.
 function detectLastHeaderRow(sh: SheetData): number {
-  // Метод 1: самая нижняя строка, которая является частью хотя бы одного объединения
   let lastMergeRow = -1;
-  for (const m of sh.merges) {
-    lastMergeRow = Math.max(lastMergeRow, m.r2);
-  }
+  for (const m of sh.merges) lastMergeRow = Math.max(lastMergeRow, m.r2);
   if (lastMergeRow >= 0) return lastMergeRow;
 
-  // Метод 2 (fallback): первая строка где > 50% непустых ячеек числовые
   const maxC = getRealColCount(sh);
   for (let r = 0; r < Math.min(sh.cells.length, 30); r++) {
     const row = sh.cells[r];
@@ -332,111 +331,110 @@ function detectLastHeaderRow(sh: SheetData): number {
     let nums = 0, total = 0;
     for (let c = 0; c < maxC; c++) {
       const v = row[c]?.v;
-      if (v !== null && v !== undefined && v !== "") {
-        total++;
-        if (typeof v === "number") nums++;
-      }
+      if (v !== null && v !== undefined && v !== "") { total++; if (typeof v === "number") nums++; }
     }
     if (total > 2 && nums / total > 0.5) return r - 1;
   }
   return 2;
 }
 
-// Строит таблицу: col → полный путь заголовков (только из строк-заголовков, никаких данных).
-// Использует ТОЛЬКО строки 0..lastHeaderRow включительно.
-function buildColHeaderMap(sh: SheetData): Map<number, string[]> {
-  const lastHR = detectLastHeaderRow(sh);
+// Строит полный контекст листа для ИИ в человеческих координатах Excel.
+// Формат:
+//   ОБЪЕДИНЕНИЯ: N13:Q13 = "Пласт А"  (строка первая — для понимания структуры)
+//   ЗАГОЛОВКИ СТОЛБЦОВ: A = "№ скв" | B = "Куст" | ... | P = "Добыча нефти / с начала года / тыс.т"
+//   ДАННЫЕ (начиная со строки X):
+//      строка 14: A14=1603  B14=1  ...  P14=45.2
+function buildSheetContext(sh: SheetData): string {
   const maxCols = getRealColCount(sh);
-  const map = new Map<number, string[]>();
-
-  for (let c = 0; c < maxCols; c++) {
-    const seen = new Set<string>();
-    const stack: string[] = [];
-
-    for (let r = 0; r <= lastHR && r < sh.cells.length; r++) {
-      // Берём реального хозяина объединения (если ячейка вторична)
-      const owner = getMergeOwner(sh, r, c);
-      const cell = owner ? sh.cells[owner.r]?.[owner.c] : sh.cells[r]?.[c];
-      const raw = cell?.w ?? (cell?.v != null ? String(cell.v) : "");
-      const val = raw.trim();
-      // Пропускаем пустые и числа (номера строк/столбцов не являются заголовками)
-      if (!val || typeof cell?.v === "number") continue;
-      if (!seen.has(val)) { seen.add(val); stack.push(val); }
-    }
-
-    if (stack.length > 0) map.set(c, stack);
-  }
-
-  return map;
-}
-
-// Строит читаемый блок-описание структуры листа для ИИ
-function buildMergeContext(sh: SheetData): string {
   const lastHR = detectLastHeaderRow(sh);
-  const maxCols = getRealColCount(sh);
-  const colHeaderMap = buildColHeaderMap(sh);
-  const lines: string[] = ["═══ КАРТА СТОЛБЦОВ ЛИСТА ═══"];
+  const firstDataRow = lastHR + 1; // Excel строка = firstDataRow+1
+  const lines: string[] = [];
 
-  lines.push(`Строки заголовков: 0..${lastHR} | Строки данных: ${lastHR + 1}..`);
-  lines.push(`Всего столбцов с данными: ${maxCols}\n`);
-
-  // Таблица: каждый столбец → его полный заголовок
-  lines.push("СТОЛБЕЦ | EXCEL | ПОЛНЫЙ ЗАГОЛОВОК (путь от верхнего уровня до конечного)");
-  lines.push("--------|-------|------------------------------------------------------");
-  for (let c = 0; c < maxCols; c++) {
-    const stack = colHeaderMap.get(c);
-    const excelCol = colLetter(c);
-    const path = stack ? stack.join(" > ") : "(нет заголовка)";
-    lines.push(`  col${String(c).padStart(2, "0")}  |  ${excelCol.padEnd(3)}  | ${path}`);
-  }
-
-  // Список объединений (для справки)
+  // 1. ОБЪЕДИНЕНИЯ — как видит человек: N13:Q13 = "Пласт А"
   if (sh.merges.length) {
-    lines.push("\nОБЪЕДИНЕНИЯ:");
+    lines.push("── ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ ──");
     for (const m of sh.merges) {
       const ownerCell = sh.cells[m.r1]?.[m.c1];
       const val = (ownerCell?.w ?? (ownerCell?.v != null ? String(ownerCell.v) : "")).trim();
       if (!val) continue;
-      const cols = m.c1 === m.c2 ? colLetter(m.c1) : `${colLetter(m.c1)}-${colLetter(m.c2)}`;
-      const rows = m.r1 === m.r2 ? `r${m.r1}` : `r${m.r1}-r${m.r2}`;
-      lines.push(`  «${val}» охватывает [${rows}, cols ${cols} (${m.c1}..${m.c2})]`);
+      const addr = m.r1 === m.r2 && m.c1 === m.c2
+        ? cellAddr(m.r1, m.c1)
+        : `${cellAddr(m.r1, m.c1)}:${cellAddr(m.r2, m.c2)}`;
+      lines.push(`  ${addr} = "${val}"`);
     }
+    lines.push("");
   }
 
-  lines.push("═══════════════════════════════════════");
+  // 2. ЗАГОЛОВКИ СТОЛБЦОВ — для каждого столбца собираем путь из строк-заголовков
+  lines.push("── ЗАГОЛОВКИ СТОЛБЦОВ ──");
+  lines.push(`(строки заголовков: 1..${lastHR + 1} | данные начинаются со строки ${firstDataRow + 1})`);
+  for (let c = 0; c < maxCols; c++) {
+    const seen = new Set<string>();
+    const parts: string[] = [];
+    for (let r = 0; r <= lastHR && r < sh.cells.length; r++) {
+      const owner = getMergeOwner(sh, r, c);
+      const cell = owner ? sh.cells[owner.r]?.[owner.c] : sh.cells[r]?.[c];
+      const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).trim();
+      if (!val || typeof cell?.v === "number") continue;
+      if (!seen.has(val)) { seen.add(val); parts.push(val); }
+    }
+    if (parts.length > 0) {
+      lines.push(`  ${colLetter(c)} = "${parts.join(" / ")}"`);
+    }
+  }
+  lines.push("");
+
+  // 3. ДАННЫЕ — каждая строка как "строка N: A=val  B=val  ..."
+  // Пишем только непустые строки, только непустые ячейки, адрес в стиле Excel
+  lines.push(`── ДАННЫЕ (строки ${firstDataRow + 1} и далее) ──`);
+  let rowsWritten = 0;
+  const MAX_DATA_ROWS = 500;
+  for (let r = firstDataRow; r < sh.cells.length && rowsWritten < MAX_DATA_ROWS; r++) {
+    const row = sh.cells[r];
+    if (!row || !row.some(c => c.v !== null)) continue;
+    const cells: string[] = [];
+    for (let c = 0; c < maxCols; c++) {
+      const owner = getMergeOwner(sh, r, c);
+      if (owner) continue; // вторичная ячейка объединения — пропускаем
+      const cell = row[c] ?? { v: null };
+      if (cell.v === null) continue;
+      const val = typeof cell.v === "number" ? String(cell.v) : (cell.w ?? String(cell.v));
+      cells.push(`${cellAddr(r, c)}=${val}`);
+    }
+    if (cells.length > 0) {
+      lines.push(`  строка ${r + 1}: ${cells.join("  ")}`);
+      rowsWritten++;
+    }
+  }
+  if (rowsWritten >= MAX_DATA_ROWS) lines.push(`  [... показано ${MAX_DATA_ROWS} строк из ${sh.cells.length}]`);
+
   return lines.join("\n");
 }
 
+// Короткий TSV-вид для неактивных листов (превью)
 function sheetToText(sh: SheetData, full = false): string {
-  const MAX_ROWS = full ? 500 : 5;
-  const MAX_CELL_LEN = 40;
+  if (full) return buildSheetContext(sh);
+  const MAX_ROWS = 5;
   const numCols = getRealColCount(sh);
-
   const dataRows: string[] = [];
   sh.cells.forEach((row, ri) => {
     if (!row.some(c => c.v !== null)) return;
     const vals = Array.from({ length: numCols }, (_, ci) => {
       const c = row[ci] ?? { v: null };
-      // НЕ показываем [↑...] в строках данных — это мусор для ИИ.
-      // Объединённые ячейки в заголовках уже описаны в buildMergeContext.
-      // В строках данных вторичная объединённая ячейка = просто пустая.
-      const owner = getMergeOwner(sh, ri, ci);
-      if (owner) return ""; // вторичная ячейка объединения = пусто
       if (typeof c.v === "number") return String(c.v);
-      const s = c.w ?? (c.v !== null ? String(c.v) : "");
-      return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…" : s;
+      return c.w ?? (c.v !== null ? String(c.v) : "");
     }).join("\t");
-    dataRows.push(`${ri}\t${vals}`);
+    dataRows.push(`${ri + 1}\t${vals}`);
   });
-
-  const totalDataRows = dataRows.length;
+  const header = "row\t" + Array.from({ length: numCols }, (_, i) => colLetter(i)).join("\t");
   const sliced = dataRows.slice(0, MAX_ROWS);
-  const header = "ROW\t" + Array.from({ length: numCols }, (_, i) => colLetter(i)).join("\t");
-  const suffix = !full && totalDataRows > MAX_ROWS
-    ? `\n[...ещё ${totalDataRows - MAX_ROWS} строк]`
-    : (full && totalDataRows > MAX_ROWS ? `\n[показано ${MAX_ROWS} из ${totalDataRows} строк]` : "");
-
+  const suffix = dataRows.length > MAX_ROWS ? `\n[...ещё ${dataRows.length - MAX_ROWS} строк]` : "";
   return [header, ...sliced].join("\n") + suffix;
+}
+
+// Алиас для кнопки "Контекст ИИ" в шапке
+function buildMergeContext(sh: SheetData): string {
+  return buildSheetContext(sh);
 }
 
 // ─── AI Settings ─────────────────────────────────────────────────────────────
@@ -648,73 +646,52 @@ function detectChartType(sheetName: string): ChartType {
 // ─── AI call (direct — no backend, no timeout) ───────────────────────────────
 
 const SYSTEM_PROMPT = `Ты — профессиональный аналитик данных и эксперт по Excel.
-Тебе передают содержимое Excel-файлов в виде текста, задание пользователя, и (опционально) изображения.
+Тебе передают содержимое Excel-файлов, задание пользователя, и (опционально) изображения.
 
-КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON и НИЧЕМ КРОМЕ JSON. Никакого текста до или после. Никаких \`\`\`json\`\`\` обёрток.
+КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON. Никакого текста вне JSON. Никаких \`\`\`json\`\`\` обёрток.
 
 Формат ответа:
 {
   "text": "Краткое объяснение что сделано (на русском, 1-3 предложения)",
-  "new_sheet": {
-    "file_index": 0,
-    "sheet_name": "Название_листа",
-    "data": [["Заголовок1","Заголовок2"],[значение1,значение2]]
-  },
-  "cell_styles": [
-    {
-      "file_index": 0,
-      "sheet_name": "Лист1",
-      "changes": [
-        {"row": 2, "col": 0, "bgColor": "FFFFFF00"}
-      ]
-    }
-  ]
+  "new_sheet": { "file_index": 0, "sheet_name": "Имя", "data": [["Заголовок"],[значение]] },
+  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":14,"col":15,"bgColor":"FFFFFF00"}] }]
 }
 
-═══ ПРАВИЛА ФОРМАТОВ ═══
-- row/col — СТРОГО 0-based. Значение из колонки ROW = он и есть row. A=col0, B=col1, C=col2, D=col3, E=col4, F=col5, G=col6, H=col7, I=col8, J=col9, K=col10, L=col11, M=col12, N=col13, O=col14, P=col15, Q=col16, R=col17, S=col18, T=col19, U=col20, V=col21, W=col22, X=col23, Y=col24, Z=col25 и далее
-- bgColor — AARRGGBB 8 символов: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, голубой=FF00B0F0
-- Числа в data пиши числами (не строками)
-- new_sheet — создать новый лист; cell_styles — покрасить ячейки в существующем листе
-- Изображение — образец структуры/оформления
+─── ФОРМАТ КООРДИНАТ ───
+Данные листа передаются в человеческих координатах Excel: адрес ячейки = буква_столбца + номер_строки.
+Пример строки данных:  строка 14: A14=1603  B14=2  P14=45.2  Q14=312.7
 
-═══ КАК ЧИТАТЬ СТРУКТУРУ ЛИСТА ═══
-Перед данными идёт секция "═══ КАРТА СТОЛБЦОВ ЛИСТА ═══".
-В ней таблица вида:
-  СТОЛБЕЦ | EXCEL | ПОЛНЫЙ ЗАГОЛОВОК
-  col00   |  A    | Номер скважины
-  col01   |  B    | Куст
-  col15   |  P    | Добыча нефти > с начала года > тыс.т
-  col16   |  Q    | Добыча нефти > с начала разработки > тыс.т
+В cell_styles используются 0-based индексы:
+  row = номер_строки_Excel - 1  (строка 14 → row:13)
+  col = номер_столбца: A=0, B=1, ..., N=13, O=14, P=15, Q=16, R=17, S=18, T=19, U=20...
+bgColor — AARRGGBB 8 символов: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000
 
-КРИТИЧЕСКИ ВАЖНО: используй ТОЛЬКО эту таблицу для определения col нужного показателя.
-НЕ угадывай col по алфавиту или позиции — всегда смотри на ПОЛНЫЙ ЗАГОЛОВОК в таблице.
+─── КАК ЧИТАТЬ СТРУКТУРУ ЛИСТА ───
+Контекст каждого листа состоит из 3 секций:
 
-Например: нужна "добыча нефти с начала года" → ищи строку где ПОЛНЫЙ ЗАГОЛОВОК содержит "добыча нефти" И "с начала года" → берёшь col из этой строки (например col15).
+1. ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ — диапазоны вида N13:Q13 = "Пласт А"
+   Это значит: ячейки N13, O13, P13, Q13 — заголовок "Пласт А".
 
-═══ КАК ЧИТАТЬ ДАННЫЕ ═══
-После карты столбцов идут данные в формате TSV:
-  ROW  A       B    ...  P      Q
-  14   1603    1    ...  45.2   312.7
-  15   1604    1    ...  38.1   280.0
+2. ЗАГОЛОВКИ СТОЛБЦОВ — для каждой буквы столбца полный путь заголовков:
+   P = "Добыча нефти / с начала года / тыс.т"
+   Читай: столбец P содержит данные о добыче нефти с начала года в тыс.т.
 
-- ROW = номер строки (0-based), используется в cell_styles как "row"
-- Строки данных начинаются ПОСЛЕ строк заголовков (указано в карте: "Строки данных: N..")
-- Числа — сырые значения без форматирования
+3. ДАННЫЕ — строки вида "строка N: A14=значение  B14=значение  P14=значение"
+   Каждая ячейка указана с адресом. Пустые ячейки не выводятся.
 
-═══ АЛГОРИТМ ДЛЯ ЛЮБОЙ ЗАДАЧИ ═══
-1. Прочитай КАРТУ СТОЛБЦОВ → найди нужный col по полному заголовку
-2. Пройди ВСЕ строки данных (от первой до последней, не пропускай)
-3. Для каждой строки: считай / проверяй условие / собирай результат
-4. Верни ВСЕ подходящие строки, не только первую
+─── АЛГОРИТМ ДЛЯ ЛЮБОЙ ЗАДАЧИ ───
+1. Прочти секцию ЗАГОЛОВКИ СТОЛБЦОВ → найди букву столбца нужного показателя
+2. Найди нужные строки в секции ДАННЫЕ (по значению в столбце скважины или условию)
+3. Для cell_styles: row = номер_строки_Excel - 1, col = позиция буквы (A=0, B=1...)
+4. Обработай ВСЕ подходящие строки — не только первую
 
-═══ ПРИМЕР ═══
-Задача: "выдели жёлтым ячейку с добычей нефти с начала года по скв 1603"
-Карта говорит: col15 (P) = "Добыча нефти > с начала года > тыс.т"
-Данные: ROW=14, colA="1603", col15=45.2
-→ Ищем строку где col0 (скважина) = 1603 → ROW=14
-→ Красим col15 строки 14: {"row": 14, "col": 15, "bgColor": "FFFFFF00"}
-НИКОГДА не красим col с "диаметр штуцера" вместо col с нужным показателем.`;
+─── ПРИМЕР ───
+Задача: "выдели P где добыча нефти с начала года < 1000 по всем скважинам"
+Из заголовков: P = "Добыча нефти / с начала года / тыс.т"
+Данные: строка 14: A14=1603  P14=850    → 850 < 1000 → {"row":13,"col":15,"bgColor":"FFFFFF00"}
+        строка 15: A15=1604  P15=1200   → 1200 >= 1000 → пропускаем
+        строка 16: A16=1605  P16=320    → 320 < 1000  → {"row":15,"col":15,"bgColor":"FFFFFF00"}
+Итог: changes содержит все строки где P < 1000.`;
 
 
 type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?: string; bold?: boolean };
@@ -759,11 +736,6 @@ async function callAi(
         ? ` [АКТИВНЫЙ — полные данные, строк: ${totalRows}, столбцов: ${realCols}]`
         : ` [краткий просмотр, всего ${totalRows} строк]`;
       contextParts.push(`--- Лист «${sh.name}»${marker} ---`);
-      // Для активного листа — сначала карта столбцов (критично для точного определения col)
-      if (isActive) {
-        contextParts.push(buildMergeContext(sh));
-        contextParts.push("\nДАННЫЕ ЛИСТА (TSV, числа — сырые значения):\n");
-      }
       contextParts.push(sheetToText(sh, isActive));
     });
   });
@@ -1549,21 +1521,28 @@ export default function Index() {
         <div className="flex items-center gap-2 flex-shrink-0">
           {activeFile && (
             <>
+              <select value={activeFile.role ?? ""}
+                onChange={(e) => setFiles(prev => prev.map(f => f.id === activeFileId ? { ...f, role: (e.target.value as "main" | "reference") || null } : f))}
+                className="text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-2 py-1.5 outline-none hidden sm:block">
+                <option value="">— роль —</option>
+                <option value="main">Основной</option>
+                <option value="reference">Образец</option>
+              </select>
               {activeSheet && (
                 <button
                   onClick={() => {
                     const sh = activeSheet;
-                    const ctx = buildMergeContext(sh) + "\n\n" + sheetToText(sh, true);
+                    const ctx = buildSheetContext(sh);
                     const w = window.open("", "_blank", "width=1000,height=750,scrollbars=yes");
                     if (w) {
-                      w.document.write(`<html><head><title>Карта столбцов — ${activeFile.name}</title><style>body{font:13px/1.6 monospace;white-space:pre;padding:20px;background:#0f1117;color:#e2e8f0}h2{color:#34d399;margin-bottom:8px}</style></head><body><h2>Карта столбцов: ${activeFile.name} → ${activeSheet.name}</h2>${ctx.replace(/</g,"&lt;")}</body></html>`);
+                      w.document.write(`<html><head><title>Контекст ИИ — ${activeFile.name}</title><style>body{font:13px/1.6 monospace;white-space:pre;padding:20px;background:#0f1117;color:#e2e8f0}h2{color:#34d399;margin-bottom:8px}</style></head><body><h2>${activeFile.name} → ${activeSheet.name}</h2>${ctx.replace(/</g,"&lt;")}</body></html>`);
                       w.document.close();
                     }
                   }}
                   className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-all"
-                  title="Показать карту столбцов — что видит ИИ">
+                  title="Показать что видит ИИ">
                   <Icon name="Table2" size={13} />
-                  <span className="hidden sm:inline">Карта столбцов</span>
+                  <span className="hidden sm:inline">Контекст ИИ</span>
                 </button>
               )}
               <button onClick={() => saveFile(activeFile.id)}
