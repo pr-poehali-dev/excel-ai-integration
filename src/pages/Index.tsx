@@ -290,90 +290,111 @@ function buildWorkbook(file: ExcelFile): XLSX.WorkBook {
 }
 
 // Полный текст листа с номерами строк (для активного листа)
-// Возвращает значение ячейки-хозяина объединения (верхняя левая)
+// Возвращает координаты хозяина объединённой ячейки (верхний левый угол)
+// Если ячейка сама является хозяином — возвращает null
 function getMergeOwner(sh: SheetData, r: number, c: number): { r: number; c: number } | null {
   for (const m of sh.merges) {
     if (r >= m.r1 && r <= m.r2 && c >= m.c1 && c <= m.c2) {
-      if (r === m.r1 && c === m.c1) return null; // сама хозяйская ячейка
+      if (r === m.r1 && c === m.c1) return null;
       return { r: m.r1, c: m.c1 };
     }
   }
   return null;
 }
 
-// Строит карту: для каждого столбца — стек заголовков сверху (из объединённых строк-заголовков)
-function buildMergeContext(sh: SheetData, maxCols: number): string {
+// Определяет реальное количество столбцов с данными (не ограничено 26)
+function getRealColCount(sh: SheetData): number {
+  let maxC = 0;
+  sh.cells.forEach(row => {
+    row.forEach((c, ci) => { if (c.v !== null) maxC = Math.max(maxC, ci + 1); });
+  });
+  // Также учитываем объединения
+  sh.merges.forEach(m => { maxC = Math.max(maxC, m.c2 + 1); });
+  return Math.min(maxC + 2, 60); // запас 2 колонки, максимум 60
+}
+
+// Определяет до какой строки идут заголовки (первая строка где есть числа)
+function detectHeaderRowCount(sh: SheetData, maxCols: number): number {
+  for (let r = 0; r < Math.min(sh.cells.length, 30); r++) {
+    const row = sh.cells[r];
+    if (!row) continue;
+    for (let c = 0; c < maxCols; c++) {
+      const cell = row[c];
+      if (cell && typeof cell.v === "number") return r; // первая строка с числом = конец заголовков
+    }
+  }
+  return 5;
+}
+
+// Строит полный контекст объединений + иерархию заголовков по столбцам
+function buildMergeContext(sh: SheetData): string {
   if (!sh.merges.length) return "";
 
-  const lines: string[] = ["ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ И ИЕРАРХИЯ ЗАГОЛОВКОВ:"];
+  const maxCols = getRealColCount(sh);
+  const headerRowCount = detectHeaderRowCount(sh, maxCols);
+  const lines: string[] = ["═══ СТРУКТУРА ОБЪЕДИНЁННЫХ ЯЧЕЕК ═══"];
 
-  // Собираем все объединения, у которых значение непустое
+  // 1. Список всех объединений с текстом
+  const mergeLines: string[] = [];
   for (const m of sh.merges) {
     const ownerCell = sh.cells[m.r1]?.[m.c1];
     const val = ownerCell?.w ?? (ownerCell?.v != null ? String(ownerCell.v) : "");
     if (!val.trim()) continue;
-
-    const r1l = m.r1, r2l = m.r2, c1l = m.c1, c2l = m.c2;
-    const colRange = c1l === c2l
-      ? colLetter(c1l)
-      : `${colLetter(c1l)}-${colLetter(c2l)}`;
-    const rowRange = r1l === r2l ? `строка ${r1l}` : `строки ${r1l}-${r2l}`;
-    lines.push(`  «${val}» → ${rowRange}, столбцы ${colRange} (col ${c1l}..${c2l})`);
+    const colRange = m.c1 === m.c2 ? colLetter(m.c1) : `${colLetter(m.c1)}:${colLetter(m.c2)}`;
+    const rowRange = m.r1 === m.r2 ? `r${m.r1}` : `r${m.r1}-r${m.r2}`;
+    mergeLines.push(`  [${rowRange}, ${colRange}] = «${val}»`);
+  }
+  if (mergeLines.length) {
+    lines.push("Все объединения:");
+    lines.push(...mergeLines);
   }
 
-  // Строим для каждого столбца список заголовков сверху вниз
-  const MAX_HEADER_ROWS = 20;
+  // 2. Иерархия заголовков для каждого столбца
+  // Проходим строки до первой числовой строки — это зона заголовков
   const colHeaders: Record<number, string[]> = {};
   for (let c = 0; c < maxCols; c++) {
+    const seen = new Set<string>();
     const stack: string[] = [];
-    for (let r = 0; r < MAX_HEADER_ROWS && r < sh.cells.length; r++) {
-      // Определяем хозяина (если ячейка вторична — берём хозяина)
+    for (let r = 0; r <= headerRowCount && r < sh.cells.length; r++) {
       const owner = getMergeOwner(sh, r, c);
-      const cell = owner
-        ? sh.cells[owner.r]?.[owner.c]
-        : sh.cells[r]?.[c];
-      const val = cell?.w ?? (cell?.v != null ? String(cell.v) : "");
-      if (val.trim()) stack.push(val.trim());
+      const cell = owner ? sh.cells[owner.r]?.[owner.c] : sh.cells[r]?.[c];
+      const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).trim();
+      if (val && !seen.has(val)) { seen.add(val); stack.push(val); }
     }
-    if (stack.length > 1) colHeaders[c] = stack;
+    if (stack.length) colHeaders[c] = stack;
   }
 
-  if (Object.keys(colHeaders).length) {
-    lines.push("\nИЕРАРХИЯ ЗАГОЛОВКОВ ПО СТОЛБЦАМ (только столбцы с многоуровневыми заголовками):");
-    for (const [c, stack] of Object.entries(colHeaders)) {
-      lines.push(`  col ${c} (${colLetter(Number(c))}): ${stack.join(" → ")}`);
-    }
+  lines.push("\nИЕРАРХИЯ ЗАГОЛОВКОВ ПО СТОЛБЦАМ:");
+  lines.push("(формат: col_индекс (буква_Excel): уровень1 > уровень2 > ... > конечный_заголовок)");
+  for (const [c, stack] of Object.entries(colHeaders)) {
+    lines.push(`  col${c} (${colLetter(Number(c))}): ${stack.join(" > ")}`);
   }
+
+  lines.push(`\nСтроки данных начинаются с row ${headerRowCount + 1} (0-based).`);
+  lines.push("═══════════════════════════════════════");
 
   return lines.join("\n");
 }
 
 function sheetToText(sh: SheetData, full = false): string {
-  const MAX_ROWS = full ? 300 : 5;
-  const MAX_COLS = 26; // до колонки Z
+  const MAX_ROWS = full ? 500 : 5;
   const MAX_CELL_LEN = 40;
 
-  const numCols = Math.min(sh.cells[0]?.length ?? 0, MAX_COLS);
+  // Берём реальное количество столбцов
+  const numCols = getRealColCount(sh);
 
-  // Строки данных — для вторичных ячеек объединения показываем значение хозяина со знаком ↑ или ←
   const dataRows: string[] = [];
   sh.cells.forEach((row, ri) => {
     if (!row.some(c => c.v !== null)) return;
-    const vals = row.slice(0, MAX_COLS).map((c, ci) => {
+    const vals = Array.from({ length: numCols }, (_, ci) => {
+      const c = row[ci] ?? { v: null };
       const owner = getMergeOwner(sh, ri, ci);
       if (owner) {
-        // Вторичная ячейка: показываем откуда берётся значение
         const ownerCell = sh.cells[owner.r]?.[owner.c];
-        const ownerVal = ownerCell?.w ?? (ownerCell?.v != null ? String(ownerCell.v) : "");
-        if (!ownerVal.trim()) return "↑merged";
-        const short = ownerVal.length > 20 ? ownerVal.slice(0, 20) + "…" : ownerVal;
-        return `[merged:«${short}»]`;
+        const ownerVal = (ownerCell?.w ?? (ownerCell?.v != null ? String(ownerCell.v) : "")).trim();
+        return ownerVal ? `[↑${ownerVal.slice(0, 15)}]` : "↑";
       }
-      // Для числовых ячеек показываем сырое число (для корректного сравнения в ИИ)
-      // и форматированное значение через |
-      if (typeof c.v === "number" && c.w && c.w !== String(c.v)) {
-        return `${c.v}|${c.w}`;
-      }
+      if (typeof c.v === "number") return String(c.v); // сырое число для ИИ
       const s = c.w ?? (c.v !== null ? String(c.v) : "");
       return s.length > MAX_CELL_LEN ? s.slice(0, MAX_CELL_LEN) + "…" : s;
     }).join("\t");
@@ -382,13 +403,12 @@ function sheetToText(sh: SheetData, full = false): string {
 
   const totalDataRows = dataRows.length;
   const sliced = dataRows.slice(0, MAX_ROWS);
-
   const header = "ROW\t" + Array.from({ length: numCols }, (_, i) => colLetter(i)).join("\t");
-  const suffix = !full && totalDataRows > MAX_ROWS ? `\n[...ещё ${totalDataRows - MAX_ROWS} строк не показано]` : "";
+  const suffix = !full && totalDataRows > MAX_ROWS
+    ? `\n[...ещё ${totalDataRows - MAX_ROWS} строк не показано]`
+    : (full && totalDataRows > MAX_ROWS ? `\n[ВНИМАНИЕ: показано ${MAX_ROWS} из ${totalDataRows} строк]` : "");
 
-  const mergeCtx = full ? "\n\n" + buildMergeContext(sh, numCols) : "";
-
-  return [header, ...sliced].join("\n") + suffix + mergeCtx;
+  return [header, ...sliced].join("\n") + suffix;
 }
 
 // ─── AI Settings ─────────────────────────────────────────────────────────────
@@ -600,7 +620,7 @@ function detectChartType(sheetName: string): ChartType {
 // ─── AI call (direct — no backend, no timeout) ───────────────────────────────
 
 const SYSTEM_PROMPT = `Ты — профессиональный аналитик данных и эксперт по Excel.
-Тебе передают содержимое одного или нескольких Excel-файлов в виде текста (TSV), задание пользователя, и (опционально) изображения — скриншоты графиков, примеры оформления.
+Тебе передают содержимое Excel-файлов в виде текста, задание пользователя, и (опционально) изображения.
 
 КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON и НИЧЕМ КРОМЕ JSON. Никакого текста до или после. Никаких \`\`\`json\`\`\` обёрток.
 
@@ -610,7 +630,7 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
   "new_sheet": {
     "file_index": 0,
     "sheet_name": "Название_листа",
-    "data": [["Заголовок1","Заголовок2"],["значение1","значение2"]]
+    "data": [["Заголовок1","Заголовок2"],[значение1,значение2]]
   },
   "cell_styles": [
     {
@@ -623,44 +643,54 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
   ]
 }
 
-ПРАВИЛА:
-1. "text" — ОБЯЗАТЕЛЬНО всегда
-2. "new_sheet" — только когда нужно создать новый лист с данными/расчётами
-3. "cell_styles" — когда нужно покрасить/форматировать ячейки в СУЩЕСТВУЮЩЕМ листе
-4. row/col в cell_styles — СТРОГО 0-based. Значение из колонки ROW в таблице данных = это и есть row. Например строка с ROW=15 → row:15
-5. col — тоже 0-based: A=0, B=1, C=2, ... N=13, O=14, P=15, Q=16 и т.д.
-6. Чтобы покрасить ячейку в НЕСКОЛЬКИХ столбцах одной строки — перечисли отдельную запись для каждого col
-7. bgColor — AARRGGBB (8 символов!): жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, голубой=FF00B0F0, розовый=FFFFC0CB
-8. fontColor — AARRGGBB цвет текста
-9. bold: true/false
-10. Числа в data — числа, текст — строки
-11. Если просят покрасить строки/ячейки — cell_styles, НЕ новый лист
-12. Изображение — используй как образец структуры/оформления
-13. ВАЖНО при работе с условиями (менее/более X): проверяй ЧИСЛОВОЕ значение ячейки из данных, не форматированный текст. Перебери ВСЕ строки с данными последовательно
+═══ ПРАВИЛА ФОРМАТОВ ═══
+- row/col — СТРОГО 0-based. ROW в таблице данных = он и есть row. A=col0, B=col1, ..., N=col13, O=col14, P=col15, Q=col16, R=col17...
+- bgColor — AARRGGBB 8 символов: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, голубой=FF00B0F0
+- Числа в data пиши числами (не строками)
+- new_sheet — создать новый лист с таблицей/расчётами
+- cell_styles — покрасить/форматировать ячейки существующего листа
+- Изображение — образец структуры/оформления
 
-АЛГОРИТМ ДЛЯ ЗАДАЧ "ВЫДЕЛИ ЯЧЕЙКИ ГДЕ ЗНАЧЕНИЕ < X":
-1. Определи нужный столбец по иерархии заголовков (из секции ИЕРАРХИЯ ЗАГОЛОВКОВ)
-2. Пройди по всем строкам данных (ROW N..M)
-3. Для каждой строки: прочитай значение ячейки в нужном col
-4. Если значение < X (или соответствует условию) — добавь запись в changes: {"row": N, "col": C, "bgColor": "FFFFA500"}
-5. Верни ВСЕ подходящие строки, не только первую
+═══ КАК ЧИТАТЬ ДАННЫЕ ЛИСТА ═══
+Таблица данных передаётся в формате TSV:
+  ROW  A    B    C    ...
+  0    ...  ...  ...
+  15   скв1 ...  42.5
 
-КАК ЧИТАТЬ ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ (MERGES):
-В данных файла ячейки помечены специально:
-- [merged:«Заголовок»] — эта ячейка входит в объединение, хозяин которого содержит текст «Заголовок»
-- ↑merged — ячейка входит в объединение с пустым хозяином
+- Первая колонка ROW = номер строки (0-based)
+- Остальные колонки = значения ячеек по столбцам A, B, C...
+- [↑Текст] в ячейке = она входит в объединение с заголовком «Текст» (принадлежит этому заголовку)
+- ↑ = входит в безымянное объединение
 
-В секции "ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ И ИЕРАРХИЯ ЗАГОЛОВКОВ" показано:
-- Какой текст стоит в хозяйской ячейке объединения
-- Какие строки и столбцы (col N..M) это объединение охватывает
-- Иерархия: для каждого столбца перечислены все заголовки сверху вниз через →
+═══ КАК ЧИТАТЬ ОБЪЕДИНЁННЫЕ ЗАГОЛОВКИ ═══
+Перед данными идёт секция "═══ СТРУКТУРА ОБЪЕДИНЁННЫХ ЯЧЕЕК ═══".
+В ней:
+1. Список всех объединений: [r12-r13, N:Q] = «Пласт А» — ячейки N:Q строк 12-13 объединены под заголовком «Пласт А»
+2. ИЕРАРХИЯ ЗАГОЛОВКОВ ПО СТОЛБЦАМ — для каждого столбца цепочка заголовков сверху вниз:
+   col15 (P): Пласт А > с начала разработки > добыча нефти, тыс.т
 
-КРИТИЧЕСКИ ВАЖНО для работы с объединёнными заголовками:
-- Если столбец P содержит в иерархии "Пласт А → с начала разработки → добыча нефти" — это значит, что данные в col P относятся к пласту А, показатель "с начала разработки", тип "добыча нефти"
-- Объединённая ячейка-заголовок распространяется на ВСЕ столбцы внутри своего диапазона (col N..M)
-- При подсчёте сумм/итогов нужно брать данные из ВСЕХ столбцов, которые входят в нужный заголовочный диапазон
-- Если просят "данные с начала разработки" — ищи в иерархии заголовков столбец с таким текстом или синонимом ("накопленная", "с н.р.", "НР", "с начала")
-- Если просят данные "по пластам" — каждый пласт это отдельный диапазон объединённого заголовка; перебери все такие диапазоны`;
+Это значит: ячейки в столбце P (col15) в строках данных = "добыча нефти с начала разработки по Пласту А"
+
+═══ АЛГОРИТМ ДЛЯ ЛЮБОЙ ЗАДАЧИ С ДАННЫМИ ═══
+ШАГ 1. Прочитай секцию ИЕРАРХИЯ ЗАГОЛОВКОВ — найди нужные столбцы (col N) по смыслу заголовков.
+ШАГ 2. Определи строки данных (после строки-заголовка, до конца таблицы).
+ШАГ 3. Пройди КАЖДУЮ строку данных по очереди (не только первую!).
+ШАГ 4. Для каждой строки возьми значение из нужного col — это сырое число.
+ШАГ 5. Применяй условие / считай / собирай результат.
+ШАГ 6. Верни ВСЕ подходящие строки/значения, не только первую найденную.
+
+═══ ПРИМЕРЫ ═══
+Задача: "покрась скважины где накопленная добыча > 10"
+→ Найди в иерархии столбец с "накопл" / "с начала" / "НР"
+→ Перебери строки 16, 17, 18... (все строки данных)
+→ Для каждой: если значение col_найденного > 10 → добавь в changes {row: N, col: 0..последний, bgColor: "FFFFA500"}
+→ changes должен содержать ВСЕ строки где условие выполнено
+
+Задача: "построй график по пластам"
+→ Найди в иерархии столбцы каждого пласта (объединения верхнего уровня)
+→ Для каждого пласта возьми нужный показатель (нужный sub-столбец)
+→ Собери данные по всем строкам и помести в new_sheet`;
+
 
 type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?: string; bold?: boolean };
 type CellStyleMutation = { fileId: string; sheetName: string; changes: CellStyleChange[] };
@@ -699,17 +729,22 @@ async function callAi(
     f.sheets.forEach((sh, si) => {
       const isActive = si === f.activeSheet;
       const totalRows = sh.cells.filter(r => r.some(c => c.v !== null)).length;
-      const numCols = Math.min(sh.cells[0]?.length ?? 0, 26);
-      const marker = isActive ? " [АКТИВНЫЙ — полные данные]" : ` [краткий просмотр, всего ${totalRows} строк]`;
+      const realCols = getRealColCount(sh);
+      const marker = isActive
+        ? ` [АКТИВНЫЙ — полные данные, строк: ${totalRows}, столбцов: ${realCols}]`
+        : ` [краткий просмотр, всего ${totalRows} строк]`;
       contextParts.push(`--- Лист «${sh.name}»${marker} ---`);
-      // Для активного листа сначала выводим структуру объединений
+      // Для активного листа — сначала структура объединений (критично для понимания данных)
       if (isActive && sh.merges.length > 0) {
-        contextParts.push(buildMergeContext(sh, numCols));
-        contextParts.push("\nДАННЫЕ ЛИСТА (в ячейках [merged:«...»] — принадлежность к объединению):");
+        contextParts.push(buildMergeContext(sh));
+        contextParts.push("\nДАННЫЕ ЛИСТА:");
+        contextParts.push("(числа — сырые значения; [↑Заголовок] = ячейка принадлежит объединению с этим заголовком)\n");
       }
       contextParts.push(sheetToText(sh, isActive));
     });
   });
+  // Отладочный вывод в консоль (помогает проверить что уходит ИИ)
+  console.debug("[DataMind] Контекст для ИИ:\n", contextParts.join("\n"));
 
   const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${contextParts.join("\n")}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}\n\nОтветь ТОЛЬКО JSON.`;
 
