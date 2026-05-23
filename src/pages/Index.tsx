@@ -1549,13 +1549,23 @@ export default function Index() {
         <div className="flex items-center gap-2 flex-shrink-0">
           {activeFile && (
             <>
-              <select value={activeFile.role ?? ""}
-                onChange={(e) => setFiles(prev => prev.map(f => f.id === activeFileId ? { ...f, role: (e.target.value as "main" | "reference") || null } : f))}
-                className="text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-2 py-1.5 outline-none hidden sm:block">
-                <option value="">— роль —</option>
-                <option value="main">Основной</option>
-                <option value="reference">Образец</option>
-              </select>
+              {activeSheet && (
+                <button
+                  onClick={() => {
+                    const sh = activeSheet;
+                    const ctx = buildMergeContext(sh) + "\n\n" + sheetToText(sh, true);
+                    const w = window.open("", "_blank", "width=1000,height=750,scrollbars=yes");
+                    if (w) {
+                      w.document.write(`<html><head><title>Карта столбцов — ${activeFile.name}</title><style>body{font:13px/1.6 monospace;white-space:pre;padding:20px;background:#0f1117;color:#e2e8f0}h2{color:#34d399;margin-bottom:8px}</style></head><body><h2>Карта столбцов: ${activeFile.name} → ${activeSheet.name}</h2>${ctx.replace(/</g,"&lt;")}</body></html>`);
+                      w.document.close();
+                    }
+                  }}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-all"
+                  title="Показать карту столбцов — что видит ИИ">
+                  <Icon name="Table2" size={13} />
+                  <span className="hidden sm:inline">Карта столбцов</span>
+                </button>
+              )}
               <button onClick={() => saveFile(activeFile.id)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeFile.isDirty ? "btn-primary" : "bg-secondary text-muted-foreground"}`}>
                 <Icon name="Save" size={13} />
@@ -1841,31 +1851,9 @@ export default function Index() {
                   <Icon name="Send" size={13} />
                 </button>
               </div>
-              <div className="flex items-center justify-between mt-1.5">
-                <p className="text-[10px] text-muted-foreground">
-                  Enter — отправить · Ctrl+V — скриншот · 🎤 — голос
-                </p>
-                {files.length > 0 && (
-                  <button
-                    onClick={() => {
-                      const ctx = (window as Window & { __datamind_last_context?: string }).__datamind_last_context;
-                      if (!ctx) {
-                        alert("Сначала отправь хотя бы один запрос — контекст появится после первой отправки.\n\nИли можно сразу: нажми Send с любым текстом, затем эту кнопку.");
-                        return;
-                      }
-                      const w = window.open("", "_blank", "width=900,height=700,scrollbars=yes");
-                      if (w) {
-                        w.document.write(`<html><head><title>Контекст ИИ</title><style>body{font:12px monospace;white-space:pre;padding:16px;background:#1a1a2e;color:#e0e0e0}</style></head><body>${ctx.replace(/</g,"&lt;")}</body></html>`);
-                        w.document.close();
-                      }
-                    }}
-                    className="text-[10px] text-muted-foreground hover:text-primary transition-colors underline underline-offset-2"
-                    title="Показать что видит ИИ"
-                  >
-                    контекст ИИ
-                  </button>
-                )}
-              </div>
+              <p className="text-[10px] text-muted-foreground mt-1.5 text-center">
+                Enter — отправить · Ctrl+V — скриншот · 🎤 — голос
+              </p>
             </div>
           </div>
         )}
