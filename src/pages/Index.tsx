@@ -317,14 +317,25 @@ function getMergeOwner(sh: SheetData, r: number, c: number): { r: number; c: num
   return null;
 }
 
-// Последняя строка зоны заголовков = нижняя граница самого нижнего объединения.
-// Если объединений нет — первая строка где >50% непустых ячеек числовые, минус 1.
+// Последняя строка зоны заголовков.
+// Алгоритм:
+//   1. Строки-разделители (объединение шириной >= 80% maxCols) не считаются заголовками столбцов.
+//   2. Берём нижнюю границу последнего "настоящего" заголовочного объединения
+//      (ширина > 1 col или высота > 1 row, но ширина < 80% maxCols).
+//   3. Если нет объединений — первая строка где >50% непустых ячеек числовые, минус 1.
 function detectLastHeaderRow(sh: SheetData): number {
-  let lastMergeRow = -1;
-  for (const m of sh.merges) lastMergeRow = Math.max(lastMergeRow, m.r2);
-  if (lastMergeRow >= 0) return lastMergeRow;
-
   const maxC = getRealColCount(sh);
+  const FULL_ROW_THRESHOLD = 0.8; // объединение шириной ≥ 80% = строка-разделитель, не заголовок
+
+  let lastHeaderMergeRow = -1;
+  for (const m of sh.merges) {
+    const spanCols = m.c2 - m.c1 + 1;
+    if (spanCols / maxC >= FULL_ROW_THRESHOLD) continue; // строка-разделитель — пропускаем
+    lastHeaderMergeRow = Math.max(lastHeaderMergeRow, m.r2);
+  }
+  if (lastHeaderMergeRow >= 0) return lastHeaderMergeRow;
+
+  // Fallback: первая строка где >50% непустых ячеек числовые
   for (let r = 0; r < Math.min(sh.cells.length, 30); r++) {
     const row = sh.cells[r];
     if (!row) continue;
@@ -338,71 +349,98 @@ function detectLastHeaderRow(sh: SheetData): number {
   return 2;
 }
 
-// Строит полный контекст листа для ИИ в человеческих координатах Excel.
-// Формат:
-//   ОБЪЕДИНЕНИЯ: N13:Q13 = "Пласт А"  (строка первая — для понимания структуры)
-//   ЗАГОЛОВКИ СТОЛБЦОВ: A = "№ скв" | B = "Куст" | ... | P = "Добыча нефти / с начала года / тыс.т"
-//   ДАННЫЕ (начиная со строки X):
-//      строка 14: A14=1603  B14=1  ...  P14=45.2
+// Возвращает смысловую цепочку заголовков для столбца c, читая строки 0..lastHR сверху вниз.
+// Каждый уровень — уникальный текст из объединения или одиночной ячейки.
+// Числа и пустые ячейки пропускаются.
+function getColHeaderChain(sh: SheetData, c: number, lastHR: number): string[] {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (let r = 0; r <= lastHR && r < sh.cells.length; r++) {
+    const owner = getMergeOwner(sh, r, c);
+    const cell = owner ? sh.cells[owner.r]?.[owner.c] : sh.cells[r]?.[c];
+    const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).trim();
+    if (!val || typeof cell?.v === "number") continue;
+    if (!seen.has(val)) { seen.add(val); parts.push(val); }
+  }
+  return parts;
+}
+
+// Строит полный контекст листа для ИИ.
+// Ключевая идея: каждая ячейка данных сопровождается ПОЛНОЙ смысловой цепочкой заголовков.
+// Пример: P12=1943 [Текущие запасы нефти / извлекаемые / A+B1]
 function buildSheetContext(sh: SheetData): string {
   const maxCols = getRealColCount(sh);
   const lastHR = detectLastHeaderRow(sh);
-  const firstDataRow = lastHR + 1; // Excel строка = firstDataRow+1
+  const firstDataRow = lastHR + 1;
   const lines: string[] = [];
 
-  // 1. ОБЪЕДИНЕНИЯ — как видит человек: N13:Q13 = "Пласт А"
-  if (sh.merges.length) {
-    lines.push("── ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ ──");
-    for (const m of sh.merges) {
-      const ownerCell = sh.cells[m.r1]?.[m.c1];
-      const val = (ownerCell?.w ?? (ownerCell?.v != null ? String(ownerCell.v) : "")).trim();
-      if (!val) continue;
-      const addr = m.r1 === m.r2 && m.c1 === m.c2
-        ? cellAddr(m.r1, m.c1)
-        : `${cellAddr(m.r1, m.c1)}:${cellAddr(m.r2, m.c2)}`;
-      lines.push(`  ${addr} = "${val}"`);
-    }
-    lines.push("");
+  // Кэш цепочек заголовков для каждого столбца
+  const colChains: Map<number, string[]> = new Map();
+  for (let c = 0; c < maxCols; c++) {
+    const chain = getColHeaderChain(sh, c, lastHR);
+    if (chain.length > 0) colChains.set(c, chain);
   }
 
-  // 2. ЗАГОЛОВКИ СТОЛБЦОВ — для каждого столбца собираем путь из строк-заголовков
+  // 1. ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ — все диапазоны с текстом в формате Excel
+  lines.push("── ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ (все диапазоны) ──");
+  for (const m of sh.merges) {
+    const ownerCell = sh.cells[m.r1]?.[m.c1];
+    const val = (ownerCell?.w ?? (ownerCell?.v != null ? String(ownerCell.v) : "")).trim();
+    if (!val) continue;
+    const addr = (m.r1 === m.r2 && m.c1 === m.c2)
+      ? cellAddr(m.r1, m.c1)
+      : `${cellAddr(m.r1, m.c1)}:${cellAddr(m.r2, m.c2)}`;
+    lines.push(`  ${addr} = "${val}"`);
+  }
+  lines.push("");
+
+  // 2. СМЫСЛОВЫЕ ЗАГОЛОВКИ КАЖДОГО СТОЛБЦА
+  // Это критически важно: для P = "Текущие запасы нефти / извлекаемые / A+B1"
   lines.push("── ЗАГОЛОВКИ СТОЛБЦОВ ──");
   lines.push(`(строки заголовков: 1..${lastHR + 1} | данные начинаются со строки ${firstDataRow + 1})`);
   for (let c = 0; c < maxCols; c++) {
-    const seen = new Set<string>();
-    const parts: string[] = [];
-    for (let r = 0; r <= lastHR && r < sh.cells.length; r++) {
-      const owner = getMergeOwner(sh, r, c);
-      const cell = owner ? sh.cells[owner.r]?.[owner.c] : sh.cells[r]?.[c];
-      const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).trim();
-      if (!val || typeof cell?.v === "number") continue;
-      if (!seen.has(val)) { seen.add(val); parts.push(val); }
-    }
-    if (parts.length > 0) {
-      lines.push(`  ${colLetter(c)} = "${parts.join(" / ")}"`);
+    const chain = colChains.get(c);
+    if (chain && chain.length > 0) {
+      lines.push(`  ${colLetter(c)} = "${chain.join(" / ")}"`);
     }
   }
   lines.push("");
 
-  // 3. ДАННЫЕ — каждая строка как "строка N: A=val  B=val  ..."
-  // Пишем только непустые строки, только непустые ячейки, адрес в стиле Excel
+  // 3. ДАННЫЕ — каждая ячейка с адресом И смысловым заголовком столбца
+  // Формат: A12="K1br пл.АС 5"  P12=1943[Текущие запасы нефти/извлекаемые/A+B1]
   lines.push(`── ДАННЫЕ (строки ${firstDataRow + 1} и далее) ──`);
   let rowsWritten = 0;
   const MAX_DATA_ROWS = 500;
+
   for (let r = firstDataRow; r < sh.cells.length && rowsWritten < MAX_DATA_ROWS; r++) {
     const row = sh.cells[r];
     if (!row || !row.some(c => c.v !== null)) continue;
+
+    // Проверяем: строка-разделитель (одно широкое объединение на всю ширину)?
+    // Такие строки тоже выводим, но помечаем как разделитель
+    const maxC = getRealColCount(sh);
+    const isGroupHeader = sh.merges.some(m =>
+      m.r1 === r && m.r2 === r && (m.c2 - m.c1 + 1) / maxC >= 0.8
+    );
+
     const cells: string[] = [];
     for (let c = 0; c < maxCols; c++) {
       const owner = getMergeOwner(sh, r, c);
-      if (owner) continue; // вторичная ячейка объединения — пропускаем
+      if (owner) continue;
       const cell = row[c] ?? { v: null };
       if (cell.v === null) continue;
       const val = typeof cell.v === "number" ? String(cell.v) : (cell.w ?? String(cell.v));
-      cells.push(`${cellAddr(r, c)}=${val}`);
+      const chain = colChains.get(c);
+      // Для строк-разделителей заголовок столбца не добавляем (там текст на всю строку)
+      const tag = (!isGroupHeader && chain && chain.length > 0)
+        ? `[${chain.join(" / ")}]`
+        : "";
+      cells.push(`${cellAddr(r, c)}=${val}${tag}`);
     }
+
     if (cells.length > 0) {
-      lines.push(`  строка ${r + 1}: ${cells.join("  ")}`);
+      const prefix = isGroupHeader ? "  [РАЗДЕЛ] " : "  ";
+      lines.push(`${prefix}строка ${r + 1}: ${cells.join("  ")}`);
       rowsWritten++;
     }
   }
@@ -654,44 +692,47 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
 {
   "text": "Краткое объяснение что сделано (на русском, 1-3 предложения)",
   "new_sheet": { "file_index": 0, "sheet_name": "Имя", "data": [["Заголовок"],[значение]] },
-  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":14,"col":15,"bgColor":"FFFFFF00"}] }]
+  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":11,"col":15,"bgColor":"FFFFFF00"}] }]
 }
 
-─── ФОРМАТ КООРДИНАТ ───
-Данные листа передаются в человеческих координатах Excel: адрес ячейки = буква_столбца + номер_строки.
-Пример строки данных:  строка 14: A14=1603  B14=2  P14=45.2  Q14=312.7
+─── КООРДИНАТЫ В cell_styles ───
+  row = номер_строки_Excel - 1  (строка 12 → row:11, строка 14 → row:13)
+  col = позиция столбца 0-based: A=0 B=1 C=2 D=3 E=4 F=5 G=6 H=7 I=8 J=9 K=10 L=11 M=12 N=13 O=14 P=15 Q=16 R=17 S=18 T=19 U=20 V=21 W=22
+bgColor — AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000
 
-В cell_styles используются 0-based индексы:
-  row = номер_строки_Excel - 1  (строка 14 → row:13)
-  col = номер_столбца: A=0, B=1, ..., N=13, O=14, P=15, Q=16, R=17, S=18, T=19, U=20...
-bgColor — AARRGGBB 8 символов: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000
+─── КАК ЧИТАТЬ ДАННЫЕ ЛИСТА ───
+Контекст передаётся в 3 секциях:
 
-─── КАК ЧИТАТЬ СТРУКТУРУ ЛИСТА ───
-Контекст каждого листа состоит из 3 секций:
+1. ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ — все объединения с адресами Excel:
+   N4:R6 = "Текущие запасы нефти"   ← ячейки N4..R6 объединены под этим заголовком
+   P7:Q8 = "извлекаемые"             ← внутри предыдущего объединения, уточняет тип
 
-1. ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ — диапазоны вида N13:Q13 = "Пласт А"
-   Это значит: ячейки N13, O13, P13, Q13 — заголовок "Пласт А".
+2. ЗАГОЛОВКИ СТОЛБЦОВ — смысловая цепочка для каждого столбца (читается сверху вниз):
+   P = "Текущие запасы нефти / извлекаемые / A+B1"
+   Это значит: ячейка Pкакая-то строка содержит текущие извлекаемые запасы нефти категории A+B1.
 
-2. ЗАГОЛОВКИ СТОЛБЦОВ — для каждой буквы столбца полный путь заголовков:
-   P = "Добыча нефти / с начала года / тыс.т"
-   Читай: столбец P содержит данные о добыче нефти с начала года в тыс.т.
+3. ДАННЫЕ — каждая ячейка с адресом и смысловым тегом в скобках:
+   строка 12: A12="K1br пл.АС 5 (р-он скв.58Р)"  P12=1943[Текущие запасы нефти/извлекаемые/A+B1]
+   Тег [...] — это полная смысловая цепочка заголовков этого столбца.
+   [РАЗДЕЛ] строка 11: A11="Участок недр..."  — строка-разделитель, не данные скважины.
 
-3. ДАННЫЕ — строки вида "строка N: A14=значение  B14=значение  P14=значение"
-   Каждая ячейка указана с адресом. Пустые ячейки не выводятся.
-
-─── АЛГОРИТМ ДЛЯ ЛЮБОЙ ЗАДАЧИ ───
-1. Прочти секцию ЗАГОЛОВКИ СТОЛБЦОВ → найди букву столбца нужного показателя
-2. Найди нужные строки в секции ДАННЫЕ (по значению в столбце скважины или условию)
-3. Для cell_styles: row = номер_строки_Excel - 1, col = позиция буквы (A=0, B=1...)
-4. Обработай ВСЕ подходящие строки — не только первую
+─── КАК НАЙТИ НУЖНУЮ ЯЧЕЙКУ ───
+1. Прочти задание → определи смысл нужного показателя (например "текущие извлекаемые запасы / A+B1")
+2. В секции ЗАГОЛОВКИ СТОЛБЦОВ найди столбец с совпадающей цепочкой
+3. В секции ДАННЫЕ найди нужную строку (по названию пласта/скважины в столбце A)
+4. Адрес ячейки = буква_столбца + номер_строки (например P12)
+5. Для cell_styles: row = номер_строки - 1, col = позиция буквы
 
 ─── ПРИМЕР ───
-Задача: "выдели P где добыча нефти с начала года < 1000 по всем скважинам"
-Из заголовков: P = "Добыча нефти / с начала года / тыс.т"
-Данные: строка 14: A14=1603  P14=850    → 850 < 1000 → {"row":13,"col":15,"bgColor":"FFFFFF00"}
-        строка 15: A15=1604  P15=1200   → 1200 >= 1000 → пропускаем
-        строка 16: A16=1605  P16=320    → 320 < 1000  → {"row":15,"col":15,"bgColor":"FFFFFF00"}
-Итог: changes содержит все строки где P < 1000.`;
+Задача: "выдели P12 — текущие извлекаемые запасы A+B1 по пласту K1br пл.АС 5"
+Из данных: строка 12: A12="K1br пл.АС 5 (р-он скв.58Р)"  P12=1943[Текущие запасы нефти/извлекаемые/A+B1]
+P = col 15, строка 12 → row = 11
+Ответ: {"row":11,"col":15,"bgColor":"FFFFFF00"}
+
+─── ВАЖНО ───
+- Тег [...] в данных — основной способ понять смысл ячейки. Используй его, а не угадывай позицию.
+- [РАЗДЕЛ] строки — разделители групп, не трогай их если задание про данные скважин.
+- Обрабатывай ВСЕ подходящие строки, не только первую.`;
 
 
 type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?: string; bold?: boolean };
