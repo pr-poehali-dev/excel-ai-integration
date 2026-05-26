@@ -692,12 +692,27 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
 
 КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON. Никакого текста вне JSON. Никаких \`\`\`json\`\`\` обёрток.
 
-Формат ответа:
+Формат ответа (используй ТОЛЬКО нужные поля):
 {
-  "text": "Краткое объяснение: шаг 1 — нашёл столбец X с цепочкой '...', шаг 2 — нашёл строку N по названию '...', итог — выделил XN",
+  "text": "Краткое объяснение действий",
   "new_sheet": { "file_index": 0, "sheet_name": "Имя", "data": [["Заголовок"],[значение]] },
-  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":11,"col":15,"bgColor":"FFFFFF00"}] }]
+  "cell_updates": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"value":76924,"formula":"=SUM(B5:B10)"}] }],
+  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"bgColor":"FFFFFF00"}] }]
 }
+
+─── КРИТИЧЕСКИ ВАЖНО: КОГДА ЧТО ИСПОЛЬЗОВАТЬ ───
+▸ new_sheet — ТОЛЬКО когда нужно создать НОВЫЙ лист или полностью заменить существующий.
+  ЗАПРЕЩЕНО использовать new_sheet если задание звучит как:
+  "пропиши формулы", "добавь суммы", "заполни строку", "пересчитай", "вставь значения", "обнови ячейки".
+  new_sheet УНИЧТОЖАЕТ все данные листа — используй только для создания с нуля.
+
+▸ cell_updates — для точечного изменения/добавления значений в СУЩЕСТВУЮЩИЙ лист.
+  Используй когда нужно: добавить формулы, вставить суммы, пересчитать ячейки, заполнить строку.
+  Данные листа при этом НЕ затрагиваются — меняются только указанные ячейки.
+  Поля объекта change: row (0-based), col (0-based), value (число/строка — результат), formula (опционально, строка вида "=SUM(B5:B10)").
+  Если передаёшь formula — также передай value = вычисленный результат формулы.
+
+▸ cell_styles — для изменения цвета/жирности ячеек. Не меняет значения.
 
 ─── КООРДИНАТЫ В cell_styles ───
   row = номер_строки_Excel - 1  (строка 12 → row:11, строка 15 → row:14)
@@ -773,6 +788,9 @@ function extractJson(raw: string): Record<string, unknown> {
   return { text: raw || "ИИ вернул пустой ответ" };
 }
 
+type CellValueChange = { row: number; col: number; value: CellValue; formula?: string };
+type CellValueMutation = { fileId: string; sheetName: string; changes: CellValueChange[] };
+
 async function callAi(
   prompt: string,
   files: ExcelFile[],
@@ -782,6 +800,7 @@ async function callAi(
   text: string;
   mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[];
   styleMutations?: CellStyleMutation[];
+  valueMutations?: CellValueMutation[];
 }> {
   const selectedModel = settings.model === "__custom__" ? settings.customModel : settings.model;
   // Модели без поддержки vision — при наличии картинок автоматически переключаем на gpt-4o-mini
@@ -897,10 +916,27 @@ async function callAi(
     }
   }
 
+  // cell_updates — точечное изменение значений ячеек без замены всего листа
+  const valueMutations: CellValueMutation[] = [];
+  if (Array.isArray(result.cell_updates)) {
+    for (const cu of result.cell_updates as { file_index?: number; sheet_name: string; changes: CellValueChange[] }[]) {
+      const targetFile = files[cu.file_index ?? 0] ?? files[0];
+      if (targetFile && cu.sheet_name && Array.isArray(cu.changes)) {
+        const safeChanges = cu.changes.filter(ch =>
+          typeof ch.row === "number" && typeof ch.col === "number" && ch.row >= 0 && ch.col >= 0
+        );
+        if (safeChanges.length > 0) {
+          valueMutations.push({ fileId: targetFile.id, sheetName: cu.sheet_name, changes: safeChanges });
+        }
+      }
+    }
+  }
+
   return {
     text: (result.text as string) || "Готово!",
     mutations: mutations.length ? mutations : undefined,
     styleMutations: styleMutations.length ? styleMutations : undefined,
+    valueMutations: valueMutations.length ? valueMutations : undefined,
   };
 }
 
@@ -1481,6 +1517,70 @@ export default function Index() {
         setFiles((prev) => prev.map((f) => {
           if (f.id !== firstSm.fileId) return f;
           const si = f.sheets.findIndex(s => s.name === firstSm.sheetName);
+          return si >= 0 ? { ...f, activeSheet: si } : f;
+        }));
+      }
+
+      // Применяем точечные изменения значений ячеек (без замены листа)
+      if (result.valueMutations && result.valueMutations.length > 0) {
+        setFiles((prev) => prev.map((f) => {
+          const vm = result.valueMutations!.filter(m => m.fileId === f.id);
+          if (!vm.length) return f;
+
+          const wb = f.workbook;
+          vm.forEach(({ sheetName, changes }) => {
+            const ws = wb.Sheets[sheetName];
+            if (!ws) return;
+            changes.forEach(({ row, col, value, formula }) => {
+              const addr = XLSX.utils.encode_cell({ r: row, c: col });
+              const displayVal = formula ? value : value;
+              const cellType = typeof value === "number" ? "n" : "s";
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const existing = ws[addr] as any;
+              ws[addr] = {
+                ...(existing ?? {}),
+                t: value == null ? "z" : cellType,
+                v: displayVal,
+                w: value != null ? String(value) : undefined,
+                ...(formula ? { f: formula.replace(/^=/, "") } : {}),
+              };
+              const ref = XLSX.utils.decode_range(ws["!ref"] || "A1");
+              if (row > ref.e.r) ref.e.r = row;
+              if (col > ref.e.c) ref.e.c = col;
+              ws["!ref"] = XLSX.utils.encode_range(ref);
+            });
+          });
+
+          const sheets = f.sheets.map((sh) => {
+            const vm2 = vm.find(m => m.sheetName === sh.name);
+            if (!vm2) return sh;
+            const cells = sh.cells.map(row => [...row]);
+            vm2.changes.forEach(({ row, col, value, formula }) => {
+              if (row >= cells.length) {
+                const colCount = cells[0]?.length ?? 30;
+                while (cells.length <= row) cells.push(Array.from({ length: colCount }, () => ({ v: null })));
+              }
+              if (col >= cells[row].length) {
+                while (cells[row].length <= col) cells[row].push({ v: null });
+              }
+              const prev = cells[row][col] ?? { v: null };
+              cells[row][col] = {
+                ...prev,
+                v: value,
+                w: formula ? formula : (value != null ? String(value) : undefined),
+              };
+            });
+            return { ...sh, cells };
+          });
+
+          return { ...f, sheets, isDirty: true };
+        }));
+
+        const firstVm = result.valueMutations[0];
+        setActiveFileId(firstVm.fileId);
+        setFiles((prev) => prev.map((f) => {
+          if (f.id !== firstVm.fileId) return f;
+          const si = f.sheets.findIndex(s => s.name === firstVm.sheetName);
           return si >= 0 ? { ...f, activeSheet: si } : f;
         }));
       }
