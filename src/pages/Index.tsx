@@ -74,9 +74,11 @@ interface DocFile {
   name: string;
   type: DocFileType;
   role: "report" | "protocol" | "database" | null;
-  text: string;      // извлечённый текст
-  html?: string;     // HTML для DOCX (сохраняет структуру)
+  text: string;
+  html?: string;            // HTML для DOCX
   pageCount?: number;
+  pageImageUrls?: string[]; // PDF: URL PNG-изображений страниц (для ИИ)
+  loading?: boolean;        // PDF: идёт конвертация
 }
 
 // Промпты с галочками
@@ -542,6 +544,7 @@ function buildMergeContext(sh: SheetData): string {
 // ─── AI Settings ─────────────────────────────────────────────────────────────
 
 const EXCEL_CHART_URL = "https://functions.poehali.dev/8376b365-14fc-4551-9fc7-0798d13ac4e6";
+const AI_EXCEL_URL = "https://functions.poehali.dev/0ca54b20-aea0-424c-8e74-fa9b445c95ba";
 
 const PRESET_PROVIDERS = [
   { label: "RouterAI (рекомендуется)", baseUrl: "https://routerai.ru/api/v1" },
@@ -908,20 +911,26 @@ async function callAi(
     });
   });
 
-  // Добавляем текстовые документы (PDF, DOCX)
+  // Добавляем DOCX-документы (текст/HTML)
   const MAX_DOC_CHARS = 30000;
-  docs.forEach((doc, di) => {
+  docs.filter(d => d.type === "docx").forEach((doc, di) => {
     const roleLabel = doc.role ? ` [${doc.role.toUpperCase()}]` : "";
-    const typeLabel = doc.type === "pdf" ? "PDF" : "Word";
-    contextParts.push(`=== ${typeLabel}-документ ${di} «${doc.name}»${roleLabel} ===`);
+    contextParts.push(`=== Word-документ ${di} «${doc.name}»${roleLabel} ===`);
     const text = doc.text.length > MAX_DOC_CHARS
       ? doc.text.slice(0, MAX_DOC_CHARS) + `\n[... документ обрезан, показано ${MAX_DOC_CHARS} из ${doc.text.length} символов]`
       : doc.text;
     contextParts.push(text);
   });
 
+  // PDF-страницы — собираем URL для передачи как изображения
+  const pdfImageUrls: string[] = [];
+  docs.filter(d => d.type === "pdf" && d.pageImageUrls && d.pageImageUrls.length > 0).forEach((doc) => {
+    const roleLabel = doc.role ? ` [${doc.role.toUpperCase()}]` : "";
+    contextParts.push(`=== PDF-документ «${doc.name}»${roleLabel} (${doc.pageCount} стр.) — страницы переданы как изображения ниже ===`);
+    pdfImageUrls.push(...(doc.pageImageUrls ?? []));
+  });
+
   const fullContext = contextParts.join("\n");
-  // Кладём в window для отладки — открой консоль и введи: copy(window.__datamind_last_context)
   (window as Window & { __datamind_last_context?: string }).__datamind_last_context = fullContext;
 
   // Активные промпты добавляем в системный промпт
@@ -932,20 +941,31 @@ async function callAi(
 
   const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}\n\nОтветь ТОЛЬКО JSON.`;
 
-  // Строим сообщение (с картинками или без)
+  // Собираем все изображения: пользовательские скриншоты + страницы PDF
   type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+  const allImageParts: ContentPart[] = [];
+  // Пользовательские картинки (base64)
+  for (const img of images) {
+    allImageParts.push({ type: "image_url", image_url: { url: img.dataUrl } });
+  }
+  // PDF-страницы (CDN URL)
+  for (const url of pdfImageUrls) {
+    allImageParts.push({ type: "image_url", image_url: { url } });
+  }
+
   let userContent: string | ContentPart[];
-  if (images.length > 0) {
-    userContent = [{ type: "text", text: textBlock } as ContentPart];
-    for (const img of images) {
-      (userContent as ContentPart[]).push({
-        type: "image_url",
-        image_url: { url: img.dataUrl },
-      });
-    }
+  if (allImageParts.length > 0) {
+    userContent = [{ type: "text", text: textBlock } as ContentPart, ...allImageParts];
   } else {
     userContent = textBlock;
   }
+
+  // Если есть PDF-картинки — форсируем vision-модель
+  const hasPdfImages = pdfImageUrls.length > 0;
+  const VISION_UNSUPPORTED_FOR_PDF = ["deepseek/deepseek-chat", "deepseek/deepseek-r1"];
+  const finalModel = (hasPdfImages && VISION_UNSUPPORTED_FOR_PDF.includes(effectiveModel))
+    ? "openai/gpt-4o"
+    : effectiveModel;
 
   const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -954,7 +974,7 @@ async function callAi(
       "Authorization": `Bearer ${settings.apiKey}`,
     },
     body: JSON.stringify({
-      model: effectiveModel,
+      model: finalModel,
       messages: [
         { role: "system", content: effectiveSystemPrompt },
         { role: "user", content: userContent },
@@ -1406,31 +1426,51 @@ export default function Index() {
     reader.readAsArrayBuffer(file);
   }, []);
 
-  // ── Load PDF ──
+  // ── Load PDF → бэкенд рендерит страницы в PNG, модель видит как картинки ──
   const loadPdf = useCallback(async (file: File) => {
-    const buf = await file.arrayBuffer();
-    const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
-    GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString();
-    const pdf = await getDocument({ data: buf }).promise;
-    let fullText = "";
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const content = await page.getTextContent();
-      const pageText = content.items.map((item) => ("str" in item ? item.str : "")).join(" ");
-      fullText += `\n[Стр. ${p}]\n${pageText}`;
-    }
     const id = crypto.randomUUID();
-    const doc: DocFile = {
+    // Сразу показываем заглушку с индикатором загрузки
+    setDocs(prev => [...prev, {
       id, name: file.name, type: "pdf", role: null,
-      text: fullText, pageCount: pdf.numPages,
-    };
-    setDocs(prev => [...prev, doc]);
+      text: "", pageCount: undefined, pageImageUrls: [], loading: true,
+    }]);
     setActiveDocId(id);
     setMessages(prev => [...prev, {
       role: "ai",
-      text: `PDF **«${file.name}»** загружен: ${pdf.numPages} стр., ~${Math.round(fullText.length / 1000)} тыс. символов.`,
-      ts: getTime(), refs: [file.name],
+      text: `Конвертирую **«${file.name}»** в изображения страниц...`,
+      ts: getTime(),
     }]);
+
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const pdf_b64 = btoa(binary);
+
+      const resp = await fetch(AI_EXCEL_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "pdf_to_images", pdf_b64, dpi: 150, max_pages: 80 }),
+      });
+      const result = await resp.json() as { page_urls: string[]; total_pages: number; rendered_pages: number };
+
+      setDocs(prev => prev.map(d => d.id !== id ? d : {
+        ...d,
+        loading: false,
+        pageCount: result.total_pages,
+        pageImageUrls: result.page_urls,
+        text: `PDF «${file.name}»: ${result.total_pages} страниц`,
+      }));
+      setMessages(prev => [...prev, {
+        role: "ai",
+        text: `PDF **«${file.name}»** готов: ${result.rendered_pages} стр. из ${result.total_pages}. Задай вопрос — ИИ увидит каждую страницу как изображение.`,
+        ts: getTime(), refs: [file.name],
+      }]);
+    } catch (e) {
+      setDocs(prev => prev.map(d => d.id !== id ? d : { ...d, loading: false, text: "Ошибка конвертации" }));
+      setMessages(prev => [...prev, { role: "ai", text: `⚠️ Не удалось загрузить PDF: ${String(e)}`, ts: getTime() }]);
+    }
   }, []);
 
   // ── Load image for AI ──
@@ -1990,12 +2030,18 @@ export default function Index() {
             const doc = docs.find(d => d.id === activeDocId);
             if (!doc) return null;
             return (
-              <div className="flex-1 overflow-auto p-4 scrollbar-thin">
-                <div className="flex items-center gap-3 mb-3 pb-3 border-b border-border/40">
+              <div className="flex-1 overflow-auto p-4 scrollbar-thin flex flex-col gap-3">
+                {/* Header */}
+                <div className="flex items-center gap-3 pb-3 border-b border-border/40 flex-shrink-0">
                   <Icon name={doc.type === "pdf" ? "FileText" : "FileEdit"} size={16} className="text-blue-400" />
                   <span className="text-sm font-medium text-foreground">{doc.name}</span>
-                  {doc.pageCount && <span className="text-xs text-muted-foreground">{doc.pageCount} стр.</span>}
-                  <span className="text-xs text-muted-foreground">~{Math.round(doc.text.length / 1000)} тыс. символов</span>
+                  {doc.loading && <Icon name="Loader2" size={13} className="text-primary spinner" />}
+                  {doc.pageCount && !doc.loading && <span className="text-xs text-muted-foreground">{doc.pageCount} стр.</span>}
+                  {doc.type === "pdf" && doc.pageImageUrls && !doc.loading && (
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-primary/15 text-primary">
+                      {doc.pageImageUrls.length} стр. → ИИ видит как картинки
+                    </span>
+                  )}
                   <select value={doc.role ?? ""} onChange={(e) => setDocs(prev => prev.map(d => d.id === doc.id ? { ...d, role: (e.target.value as DocFile["role"]) || null } : d))}
                     className="ml-auto text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-2 py-1 outline-none">
                     <option value="">— роль —</option>
@@ -2004,12 +2050,37 @@ export default function Index() {
                     <option value="database">База данных</option>
                   </select>
                 </div>
-                {doc.html ? (
+
+                {/* Loading state */}
+                {doc.loading && (
+                  <div className="flex-1 flex flex-col items-center justify-center gap-3 text-muted-foreground">
+                    <Icon name="Loader2" size={32} className="text-primary spinner" />
+                    <p className="text-sm">Конвертирую страницы PDF в изображения...</p>
+                    <p className="text-xs">ИИ увидит документ точно как человек — с таблицами, графиками и форматированием</p>
+                  </div>
+                )}
+
+                {/* PDF: grid of page images */}
+                {doc.type === "pdf" && !doc.loading && doc.pageImageUrls && doc.pageImageUrls.length > 0 && (
+                  <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                    {doc.pageImageUrls.map((url, pi) => (
+                      <div key={pi} className="relative rounded-lg overflow-hidden border border-border/40 cursor-pointer hover:border-primary/40 transition-all"
+                        onClick={() => window.open(url, "_blank")}>
+                        <img src={url} alt={`Стр. ${pi + 1}`} className="w-full object-contain bg-white" loading="lazy" />
+                        <div className="absolute bottom-0 left-0 right-0 px-2 py-1 text-[10px] text-white/80 text-center"
+                          style={{ background: "rgba(0,0,0,0.5)" }}>
+                          стр. {pi + 1}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* DOCX: HTML content */}
+                {doc.type === "docx" && doc.html && (
                   <div className="prose prose-invert prose-sm max-w-none text-xs leading-relaxed"
                     style={{ color: "hsl(215,14%,75%)" }}
                     dangerouslySetInnerHTML={{ __html: doc.html }} />
-                ) : (
-                  <pre className="text-xs text-muted-foreground leading-relaxed whitespace-pre-wrap font-mono">{doc.text}</pre>
                 )}
               </div>
             );

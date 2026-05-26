@@ -17,6 +17,13 @@
         "api_key": "test"
       },
       "expectedStatus": 400
+    },
+    {
+      "name": "pdf_to_images без данных возвращает 400",
+      "method": "POST",
+      "path": "/",
+      "body": { "action": "pdf_to_images" },
+      "expectedStatus": 400
     }
   ]
 }

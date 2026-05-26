@@ -1,11 +1,15 @@
 """
 ИИ-аналитик для Excel: принимает контекст файлов и задание,
 возвращает текстовый ответ + данные нового листа.
+Также конвертирует PDF в изображения страниц (action=pdf_to_images).
 """
 
 import os
 import json
 import re
+import base64
+import uuid
+
 from openai import OpenAI
 
 SYSTEM_PROMPT = """Ты — профессиональный аналитик данных и эксперт по Excel.
@@ -49,49 +53,97 @@ SYSTEM_PROMPT = """Ты — профессиональный аналитик д
 DEFAULT_BASE_URL = "https://routerai.ru/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-chat"
 
+CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+}
+
 
 def extract_json(raw: str) -> dict:
     """Извлекает JSON из ответа даже если модель добавила лишний текст"""
     raw = raw.strip()
-
-    # Убираем markdown-обёртку
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     raw = raw.strip()
-
-    # Пробуем напрямую
     try:
         return json.loads(raw)
     except Exception:
         pass
-
-    # Ищем первый JSON-объект в тексте
     match = re.search(r'\{.*\}', raw, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())
         except Exception:
             pass
-
     return {"text": raw or "ИИ вернул пустой ответ"}
 
 
+def handle_pdf_to_images(body: dict) -> dict:
+    """Конвертирует PDF (base64) в PNG-изображения страниц, сохраняет в S3, возвращает URL."""
+    import fitz  # PyMuPDF
+    import boto3
+
+    pdf_b64 = body.get("pdf_b64", "")
+    if not pdf_b64:
+        return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "pdf_b64 required"})}
+
+    dpi = min(int(body.get("dpi", 150)), 200)
+    max_pages = min(int(body.get("max_pages", 50)), 100)
+
+    pdf_bytes = base64.b64decode(pdf_b64)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = len(doc)
+    pages_to_render = min(total_pages, max_pages)
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url="https://bucket.poehali.dev",
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    )
+    access_key = os.environ["AWS_ACCESS_KEY_ID"]
+    session_id = str(uuid.uuid4())[:8]
+    matrix = fitz.Matrix(dpi / 72, dpi / 72)
+    page_urls = []
+
+    for page_num in range(pages_to_render):
+        page = doc[page_num]
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        img_bytes = pix.tobytes("png")
+        key = f"pdf_pages/{session_id}/page_{page_num + 1:03d}.png"
+        s3.put_object(Bucket="files", Key=key, Body=img_bytes, ContentType="image/png")
+        url = f"https://cdn.poehali.dev/projects/{access_key}/bucket/{key}"
+        page_urls.append(url)
+
+    doc.close()
+
+    return {
+        "statusCode": 200,
+        "headers": {**CORS},
+        "body": json.dumps({
+            "page_urls": page_urls,
+            "total_pages": total_pages,
+            "rendered_pages": pages_to_render,
+            "session_id": session_id,
+        }),
+    }
+
+
 def handler(event: dict, context) -> dict:
-    """Обработка ИИ-запроса к Excel-данным"""
+    """Обработка ИИ-запроса к Excel-данным или конвертация PDF в изображения"""
 
     if event.get("httpMethod") == "OPTIONS":
-        return {
-            "statusCode": 200,
-            "headers": {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
-                "Access-Control-Max-Age": "86400",
-            },
-            "body": "",
-        }
+        return {"statusCode": 200, "headers": {**CORS}, "body": ""}
 
     body = json.loads(event.get("body") or "{}")
+
+    # Роутинг по action
+    if body.get("action") == "pdf_to_images":
+        return handle_pdf_to_images(body)
+
+    # ── Основная логика: ИИ по Excel ──
     prompt = body.get("prompt", "").strip()
     files_context = body.get("files_context", [])
     images = body.get("images", [])  # [{name, data (base64), mime}]
@@ -103,20 +155,19 @@ def handler(event: dict, context) -> dict:
     if not prompt and not images:
         return {
             "statusCode": 400,
-            "headers": {"Access-Control-Allow-Origin": "*"},
+            "headers": {**CORS},
             "body": json.dumps({"error": "Пустой запрос"}, ensure_ascii=False),
         }
 
     if not api_key:
         return {
             "statusCode": 400,
-            "headers": {"Access-Control-Allow-Origin": "*"},
+            "headers": {**CORS},
             "body": json.dumps({"error": "API ключ не указан"}, ensure_ascii=False),
         }
 
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=25.0)
 
-    # Формируем контекст из файлов
     context_parts = []
     for i, fc in enumerate(files_context):
         role_label = ""
@@ -135,7 +186,6 @@ def handler(event: dict, context) -> dict:
 
     text_block = f"ДАННЫЕ ФАЙЛОВ:\n{chr(10).join(context_parts)}\n\nЗАДАНИЕ: {prompt or '(см. изображения)'}\n\nОтветь ТОЛЬКО JSON."
 
-    # Строим content: текст + изображения (vision)
     if images:
         user_content = [{"type": "text", "text": text_block}]
         for img in images:
@@ -164,17 +214,16 @@ def handler(event: dict, context) -> dict:
             err_msg = "Модель не успела ответить за отведённое время. Попробуй ещё раз или выбери более быструю модель (например GPT-4o mini или Gemini Flash)."
         return {
             "statusCode": 200,
-            "headers": {"Access-Control-Allow-Origin": "*", "Content-Type": "application/json"},
+            "headers": {**CORS, "Content-Type": "application/json"},
             "body": json.dumps({"text": f"⚠️ {err_msg}"}, ensure_ascii=False),
         }
 
     raw = response.choices[0].message.content or "{}"
     print(f"[AI RAW RESPONSE]: {raw[:500]}")
-
     result = extract_json(raw)
 
     return {
         "statusCode": 200,
-        "headers": {"Access-Control-Allow-Origin": "*", "Content-Type": "application/json"},
+        "headers": {**CORS, "Content-Type": "application/json"},
         "body": json.dumps(result, ensure_ascii=False),
     }
