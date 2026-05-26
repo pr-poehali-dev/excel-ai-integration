@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import * as XLSX from "xlsx";
 import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid } from "recharts";
 import Icon from "@/components/ui/icon";
+import mammoth from "mammoth";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -65,6 +66,65 @@ interface ExcelFile {
   workbook: XLSX.WorkBook;
   isDirty: boolean;
 }
+
+// Текстовые документы (PDF, DOCX)
+type DocFileType = "pdf" | "docx";
+interface DocFile {
+  id: string;
+  name: string;
+  type: DocFileType;
+  role: "report" | "protocol" | "database" | null;
+  text: string;      // извлечённый текст
+  html?: string;     // HTML для DOCX (сохраняет структуру)
+  pageCount?: number;
+}
+
+// Промпты с галочками
+interface PromptPreset {
+  id: string;
+  label: string;
+  text: string;
+  enabled: boolean;
+}
+
+const DEFAULT_PROMPTS: PromptPreset[] = [
+  {
+    id: "role",
+    label: "Роль: разработчик месторождений",
+    enabled: true,
+    text: `Ты разработчик нефтяных и газовых месторождений. Выполняешь проекты пробной эксплуатации, проекты на разработку месторождений и дополнения к ним (ПТД). За основу берёшь действующий проект ПТД, актуализируешь данные и анализ на основе обновлённой базы данных.`,
+  },
+  {
+    id: "tables_db",
+    label: "Таблицы из базы данных",
+    enabled: false,
+    text: `Твоя задача: брать базу данных которую тебе предоставят, проверять и обновлять таблицы протокола ЦКР. Объект разработки — это сумма всех пластов, входящих в него (см. Таблицу «База данных» или раздел VII Принципиальные положения документа ПТД).`,
+  },
+  {
+    id: "tables_protocol",
+    label: "Таблицы протокола ЦКР",
+    enabled: false,
+    text: `На основе таблиц протокола и базы данных актуализируй таблицы протокола ЦКР. Эталоном являются таблицы протокола — при любых расхождениях с текстом отчёта сообщай, выделяя красным. Сначала утверждаем данные в таблицах ЦКР, затем правим текст отчёта.`,
+  },
+  {
+    id: "update_report",
+    label: "Актуализация отчёта (Главы 3, 5, 6)",
+    enabled: false,
+    text: `Актуализируй текст и таблицы отчёта в Word (Главы 3, 5, 6). В Word сохраняй все стили как в исходнике. Твоя задача — только описание, сохраняя стиль и подачу исходника, актуализируя только числовые значения. Все изменения закрашивай в Word зелёным цветом, сохраняя основные шрифты. По запросу проверяй главы с цифрами по всему отчёту на основе данных из таблиц протокола и базы данных.`,
+  },
+  {
+    id: "excel_formulas",
+    label: "Формулы Excel 2010",
+    enabled: false,
+    text: `Все формулы пиши для Excel 2010. Примеры: =СУММ(B5:B10); =ВПР(); =ПРОМЕЖУТОЧНЫЕ.ИТОГИ(9;). Формулы указывай в синтаксисе русского Excel 2010.`,
+  },
+  {
+    id: "protocol_update",
+    label: "Обновление протоколов ЦКР",
+    enabled: false,
+    text: `Проверяй и обновляй Протоколы ЦКР: описывай подразделы согласно образцу, редактируй данные на основе обновлений таблиц протокола.`,
+  },
+];
 
 interface ChatImage {
   dataUrl: string;
@@ -521,6 +581,25 @@ function saveSettings(s: AiSettings) {
   localStorage.setItem("datamind_ai_settings", JSON.stringify(s));
 }
 
+function loadPrompts(): PromptPreset[] {
+  try {
+    const s = localStorage.getItem("datamind_prompts");
+    if (s) {
+      const saved = JSON.parse(s) as PromptPreset[];
+      // Мержим сохранённые с дефолтными (на случай новых промптов)
+      return DEFAULT_PROMPTS.map(def => {
+        const found = saved.find(p => p.id === def.id);
+        return found ? { ...def, enabled: found.enabled, text: found.text } : def;
+      });
+    }
+  } catch (e) { void e; }
+  return DEFAULT_PROMPTS;
+}
+
+function savePrompts(prompts: PromptPreset[]) {
+  localStorage.setItem("datamind_prompts", JSON.stringify(prompts));
+}
+
 // ─── Settings Modal ───────────────────────────────────────────────────────────
 
 interface SettingsModalProps {
@@ -795,7 +874,9 @@ async function callAi(
   prompt: string,
   files: ExcelFile[],
   settings: AiSettings,
-  images: ChatImage[]
+  images: ChatImage[],
+  docs: DocFile[],
+  activePrompts: PromptPreset[]
 ): Promise<{
   text: string;
   mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[];
@@ -814,7 +895,7 @@ async function callAi(
   const contextParts: string[] = [];
   files.forEach((f, fi) => {
     const roleLabel = f.role === "main" ? " [ОСНОВНОЙ]" : f.role === "reference" ? " [ОБРАЗЕЦ]" : "";
-    contextParts.push(`=== Файл ${fi} «${f.name}»${roleLabel} ===`);
+    contextParts.push(`=== Excel-файл ${fi} «${f.name}»${roleLabel} ===`);
     f.sheets.forEach((sh, si) => {
       const isActive = si === f.activeSheet;
       const totalRows = sh.cells.filter(r => r.some(c => c.v !== null)).length;
@@ -827,9 +908,27 @@ async function callAi(
     });
   });
 
+  // Добавляем текстовые документы (PDF, DOCX)
+  const MAX_DOC_CHARS = 30000;
+  docs.forEach((doc, di) => {
+    const roleLabel = doc.role ? ` [${doc.role.toUpperCase()}]` : "";
+    const typeLabel = doc.type === "pdf" ? "PDF" : "Word";
+    contextParts.push(`=== ${typeLabel}-документ ${di} «${doc.name}»${roleLabel} ===`);
+    const text = doc.text.length > MAX_DOC_CHARS
+      ? doc.text.slice(0, MAX_DOC_CHARS) + `\n[... документ обрезан, показано ${MAX_DOC_CHARS} из ${doc.text.length} символов]`
+      : doc.text;
+    contextParts.push(text);
+  });
+
   const fullContext = contextParts.join("\n");
   // Кладём в window для отладки — открой консоль и введи: copy(window.__datamind_last_context)
   (window as Window & { __datamind_last_context?: string }).__datamind_last_context = fullContext;
+
+  // Активные промпты добавляем в системный промпт
+  const activePromptsText = activePrompts.filter(p => p.enabled).map(p => p.text).join("\n\n");
+  const effectiveSystemPrompt = activePromptsText
+    ? `${activePromptsText}\n\n---\n\n${SYSTEM_PROMPT}`
+    : SYSTEM_PROMPT;
 
   const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}\n\nОтветь ТОЛЬКО JSON.`;
 
@@ -857,7 +956,7 @@ async function callAi(
     body: JSON.stringify({
       model: effectiveModel,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: effectiveSystemPrompt },
         { role: "user", content: userContent },
       ],
       max_tokens: 4000,
@@ -1185,7 +1284,7 @@ export default function Index() {
   const [selected, setSelected] = useState<{ row: number; col: number } | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>(() => window.__datamind_messages ?? [{
     role: "ai",
-    text: "Загрузи один или несколько Excel-файлов. Я вижу все их содержимое и могу выполнять задания — считать, трансформировать, создавать новые листы.\n\nМожно прикрепить **скриншот графика** — я пойму как его воспроизвести на твоих данных.",
+    text: "Загрузи Excel, Word или PDF файлы. Я вижу всё содержимое и могу выполнять задания — анализировать, сверять данные, актуализировать таблицы и текст.\n\nМожно прикрепить **скриншот графика** — я пойму как его воспроизвести на твоих данных.",
     ts: getTime(),
   }]);
   const [aiInput, setAiInput] = useState("");
@@ -1193,10 +1292,16 @@ export default function Index() {
   const [aiThinking, setAiThinking] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [promptsOpen, setPromptsOpen] = useState(false);
   const navigate = useNavigate();
   const [aiSettings, setAiSettings] = useState<AiSettings>(loadSettings);
   const [, setAiError] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
+  const [docs, setDocs] = useState<DocFile[]>([]);
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
+  const [prompts, setPrompts] = useState<PromptPreset[]>(loadPrompts);
+  const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
+  const docInputRef = useRef<HTMLInputElement>(null);
 
   // Сохраняем в window при каждом изменении
   useEffect(() => { window.__datamind_files = files; }, [files]);
@@ -1272,8 +1377,61 @@ export default function Index() {
   const handleFiles = useCallback((fileList: FileList) => {
     Array.from(fileList).forEach((f) => {
       if (f.name.match(/\.(xlsx|xls|csv)$/i)) loadFile(f);
+      else if (f.name.match(/\.docx$/i)) loadDocx(f);
+      else if (f.name.match(/\.pdf$/i)) loadPdf(f);
     });
-  }, [loadFile]);
+  }, [loadFile]); // loadDocx и loadPdf добавятся ниже
+
+  // ── Load DOCX ──
+  const loadDocx = useCallback((file: File) => {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const buf = e.target!.result as ArrayBuffer;
+      const result = await mammoth.convertToHtml({ arrayBuffer: buf });
+      const textResult = await mammoth.extractRawText({ arrayBuffer: buf });
+      const id = crypto.randomUUID();
+      const doc: DocFile = {
+        id, name: file.name, type: "docx", role: null,
+        text: textResult.value,
+        html: result.value,
+      };
+      setDocs(prev => [...prev, doc]);
+      setActiveDocId(id);
+      setMessages(prev => [...prev, {
+        role: "ai",
+        text: `Документ **«${file.name}»** загружен: ~${Math.round(textResult.value.length / 1000)} тыс. символов.`,
+        ts: getTime(), refs: [file.name],
+      }]);
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  // ── Load PDF ──
+  const loadPdf = useCallback(async (file: File) => {
+    const buf = await file.arrayBuffer();
+    const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
+    GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString();
+    const pdf = await getDocument({ data: buf }).promise;
+    let fullText = "";
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      const pageText = content.items.map((item) => ("str" in item ? item.str : "")).join(" ");
+      fullText += `\n[Стр. ${p}]\n${pageText}`;
+    }
+    const id = crypto.randomUUID();
+    const doc: DocFile = {
+      id, name: file.name, type: "pdf", role: null,
+      text: fullText, pageCount: pdf.numPages,
+    };
+    setDocs(prev => [...prev, doc]);
+    setActiveDocId(id);
+    setMessages(prev => [...prev, {
+      role: "ai",
+      text: `PDF **«${file.name}»** загружен: ${pdf.numPages} стр., ~${Math.round(fullText.length / 1000)} тыс. символов.`,
+      ts: getTime(), refs: [file.name],
+    }]);
+  }, []);
 
   // ── Load image for AI ──
   const loadImage = useCallback((file: File) => {
@@ -1390,7 +1548,7 @@ export default function Index() {
     setAiError(null);
 
     try {
-      const result = await callAi(text, files, aiSettings, imgs);
+      const result = await callAi(text, files, aiSettings, imgs, docs, prompts);
 
       let chartData: { name: string; value: number }[] | undefined;
       let chartTitle: string | undefined;
@@ -1658,8 +1816,8 @@ export default function Index() {
         <div className="flex items-center gap-1 flex-1 overflow-x-auto scrollbar-thin min-w-0">
           {files.map((f) => (
             <div key={f.id} role="button" tabIndex={0}
-              onClick={() => { setActiveFileId(f.id); setEditing(null); setSelected(null); }}
-              onKeyDown={(e) => { if (e.key === "Enter") { setActiveFileId(f.id); setEditing(null); setSelected(null); } }}
+              onClick={() => { setActiveFileId(f.id); setActiveDocId(null); setEditing(null); setSelected(null); }}
+              onKeyDown={(e) => { if (e.key === "Enter") { setActiveFileId(f.id); setActiveDocId(null); } }}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all cursor-pointer ${f.id === activeFileId ? "bg-primary/10 text-primary border border-primary/30" : "text-muted-foreground hover:text-foreground hover:bg-secondary"}`}>
               <Icon name="FileSpreadsheet" size={13} />
               <span className="max-w-[120px] truncate">{f.name}</span>
@@ -1678,8 +1836,26 @@ export default function Index() {
               </button>
             </div>
           ))}
-          <button onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all flex-shrink-0">
+          {/* Doc tabs (PDF / DOCX) */}
+          {docs.map((d) => (
+            <div key={d.id} role="button" tabIndex={0}
+              onClick={() => { setActiveDocId(d.id); setActiveFileId(null); }}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium flex-shrink-0 transition-all cursor-pointer ${d.id === activeDocId ? "bg-blue-500/15 text-blue-400 border border-blue-500/30" : "text-muted-foreground hover:text-foreground hover:bg-secondary"}`}>
+              <Icon name={d.type === "pdf" ? "FileText" : "FileEdit"} size={13} />
+              <span className="max-w-[120px] truncate">{d.name}</span>
+              {d.role && <span className="text-[10px] px-1 rounded tag-blue">{d.role}</span>}
+              <button onClick={(e) => {
+                e.stopPropagation();
+                setDocs(prev => prev.filter(dd => dd.id !== d.id));
+                if (activeDocId === d.id) setActiveDocId(null);
+              }} className="ml-0.5 opacity-40 hover:opacity-100 transition-opacity">
+                <Icon name="X" size={11} />
+              </button>
+            </div>
+          ))}
+          <button onClick={() => docInputRef.current?.click()}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all flex-shrink-0"
+            title="Открыть Excel, Word или PDF">
             <Icon name="Plus" size={13} />
             <span className="hidden sm:inline">Открыть</span>
           </button>
@@ -1727,6 +1903,17 @@ export default function Index() {
             <span className="hidden lg:inline max-w-[100px] truncate">
               {aiSettings.apiKey ? effectiveModelLabel : "Нет ключа"}
             </span>
+          </button>
+          <button onClick={() => setPromptsOpen(p => !p)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all border ${prompts.some(p => p.enabled) ? "text-primary border-primary/40 bg-primary/10" : "text-muted-foreground border-border/40 hover:text-foreground hover:bg-secondary"}`}
+            title="Управление промптами">
+            <Icon name="ListChecks" size={14} />
+            <span className="hidden sm:inline">Промпты</span>
+            {prompts.some(p => p.enabled) && (
+              <span className="w-4 h-4 rounded-full bg-primary text-[9px] text-primary-foreground flex items-center justify-center font-bold">
+                {prompts.filter(p => p.enabled).length}
+              </span>
+            )}
           </button>
           <button onClick={() => navigate("/oilfield")}
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all border border-border/40"
@@ -1777,21 +1964,56 @@ export default function Index() {
           )}
 
           {/* Drop zone / empty state */}
-          {files.length === 0 && (
+          {files.length === 0 && docs.length === 0 && (
             <div className="flex-1 flex flex-col items-center justify-center gap-6 p-8 cursor-pointer"
               onDragOver={(e) => e.preventDefault()}
               onDrop={(e) => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}
-              onClick={() => fileInputRef.current?.click()}>
+              onClick={() => docInputRef.current?.click()}>
               <div className="w-20 h-20 rounded-3xl bg-secondary flex items-center justify-center"
                 style={{ boxShadow: "0 0 60px rgba(52,211,153,0.08)" }}>
-                <Icon name="FileSpreadsheet" size={40} className="text-primary" />
+                <Icon name="Files" size={40} className="text-primary" />
               </div>
               <div className="text-center">
-                <p className="text-foreground font-semibold text-lg mb-1">Перетащи Excel-файл</p>
-                <p className="text-muted-foreground text-sm">или нажми чтобы выбрать · .xlsx, .xls, .csv</p>
+                <p className="text-foreground font-semibold text-lg mb-1">Перетащи файлы сюда</p>
+                <p className="text-muted-foreground text-sm">Excel · Word · PDF</p>
+              </div>
+              <div className="flex gap-3 text-[11px] text-muted-foreground">
+                <span className="flex items-center gap-1"><Icon name="FileSpreadsheet" size={12} /> .xlsx .xls .csv</span>
+                <span className="flex items-center gap-1"><Icon name="FileEdit" size={12} /> .docx</span>
+                <span className="flex items-center gap-1"><Icon name="FileText" size={12} /> .pdf</span>
               </div>
             </div>
           )}
+
+          {/* Document viewer (PDF / DOCX) */}
+          {activeDocId && (() => {
+            const doc = docs.find(d => d.id === activeDocId);
+            if (!doc) return null;
+            return (
+              <div className="flex-1 overflow-auto p-4 scrollbar-thin">
+                <div className="flex items-center gap-3 mb-3 pb-3 border-b border-border/40">
+                  <Icon name={doc.type === "pdf" ? "FileText" : "FileEdit"} size={16} className="text-blue-400" />
+                  <span className="text-sm font-medium text-foreground">{doc.name}</span>
+                  {doc.pageCount && <span className="text-xs text-muted-foreground">{doc.pageCount} стр.</span>}
+                  <span className="text-xs text-muted-foreground">~{Math.round(doc.text.length / 1000)} тыс. символов</span>
+                  <select value={doc.role ?? ""} onChange={(e) => setDocs(prev => prev.map(d => d.id === doc.id ? { ...d, role: (e.target.value as DocFile["role"]) || null } : d))}
+                    className="ml-auto text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-2 py-1 outline-none">
+                    <option value="">— роль —</option>
+                    <option value="report">Отчёт</option>
+                    <option value="protocol">Протокол ЦКР</option>
+                    <option value="database">База данных</option>
+                  </select>
+                </div>
+                {doc.html ? (
+                  <div className="prose prose-invert prose-sm max-w-none text-xs leading-relaxed"
+                    style={{ color: "hsl(215,14%,75%)" }}
+                    dangerouslySetInnerHTML={{ __html: doc.html }} />
+                ) : (
+                  <pre className="text-xs text-muted-foreground leading-relaxed whitespace-pre-wrap font-mono">{doc.text}</pre>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Chart view */}
           {activeFile && activeSheet && activeSheet.chartType && (
@@ -1851,7 +2073,7 @@ export default function Index() {
               </button>
             )}
 
-            {files.length > 0 && (
+            {(files.length > 0 || docs.length > 0) && (
               <div className="px-3 py-2 border-b border-border/30 flex flex-wrap gap-1.5">
                 {files.map((f) => (
                   <div key={f.id} className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] tag-emerald">
@@ -1859,6 +2081,20 @@ export default function Index() {
                     <span className="max-w-[80px] truncate">{f.name}</span>
                   </div>
                 ))}
+                {docs.map((d) => (
+                  <div key={d.id} className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px]"
+                    style={{ background: "rgba(59,130,246,0.15)", color: "#60a5fa" }}>
+                    <Icon name={d.type === "pdf" ? "FileText" : "FileEdit"} size={10} />
+                    <span className="max-w-[80px] truncate">{d.name}</span>
+                  </div>
+                ))}
+                {prompts.some(p => p.enabled) && (
+                  <div className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] bg-primary/15 text-primary cursor-pointer"
+                    onClick={() => setPromptsOpen(true)}>
+                    <Icon name="ListChecks" size={10} />
+                    <span>{prompts.filter(p => p.enabled).length} промпт(а)</span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1984,7 +2220,7 @@ export default function Index() {
                 <textarea ref={textareaRef} value={aiInput}
                   onChange={(e) => setAiInput(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleAiSend(); } }}
-                  placeholder={isListening ? "🎤 Говорите..." : (files.length === 0 ? "Сначала загрузи файл..." : "Задание для ИИ...")}
+                  placeholder={isListening ? "🎤 Говорите..." : (files.length === 0 && docs.length === 0 ? "Сначала загрузи файл..." : "Задание для ИИ...")}
                   disabled={aiThinking}
                   rows={2}
                   className={`flex-1 px-3 py-2 rounded-lg border text-xs text-foreground placeholder:text-muted-foreground focus:outline-none resize-none transition-all scrollbar-thin ${
@@ -2008,8 +2244,97 @@ export default function Index() {
 
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" multiple className="hidden"
         onChange={(e) => e.target.files && handleFiles(e.target.files)} />
+      <input ref={docInputRef} type="file" accept=".xlsx,.xls,.csv,.docx,.pdf" multiple className="hidden"
+        onChange={(e) => { if (e.target.files) handleFiles(e.target.files); e.target.value = ""; }} />
       <input ref={imageInputRef} type="file" accept="image/*" multiple className="hidden"
         onChange={(e) => { if (e.target.files) Array.from(e.target.files).forEach(loadImage); e.target.value = ""; }} />
+
+      {/* ── Prompts Modal ── */}
+      {promptsOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-16 px-4" style={{ background: "rgba(0,0,0,0.7)" }}
+          onClick={(e) => { if (e.target === e.currentTarget) setPromptsOpen(false); }}>
+          <div className="w-full max-w-2xl rounded-2xl border border-border/60 flex flex-col max-h-[80vh]"
+            style={{ background: "hsl(220,14%,8%)" }}>
+            <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3">
+              <Icon name="ListChecks" size={16} className="text-primary" />
+              <h2 className="font-semibold text-sm text-foreground flex-1">Управление промптами</h2>
+              <p className="text-xs text-muted-foreground">Галочкой выбери что подключить к ИИ</p>
+              <button onClick={() => setPromptsOpen(false)} className="text-muted-foreground hover:text-foreground transition-colors ml-2">
+                <Icon name="X" size={16} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-2">
+              {prompts.map((p) => (
+                <div key={p.id} className={`rounded-xl border transition-all ${p.enabled ? "border-primary/40 bg-primary/5" : "border-border/40"}`}>
+                  <div className="flex items-start gap-3 p-3">
+                    <button onClick={() => {
+                      const updated = prompts.map(pp => pp.id === p.id ? { ...pp, enabled: !pp.enabled } : pp);
+                      setPrompts(updated);
+                      savePrompts(updated);
+                    }} className={`w-5 h-5 rounded flex items-center justify-center flex-shrink-0 mt-0.5 border-2 transition-all ${p.enabled ? "bg-primary border-primary" : "border-border/60 hover:border-primary/50"}`}>
+                      {p.enabled && <Icon name="Check" size={11} className="text-primary-foreground" />}
+                    </button>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-semibold text-foreground mb-1">{p.label}</p>
+                      {editingPrompt === p.id ? (
+                        <textarea
+                          defaultValue={p.text}
+                          onBlur={(e) => {
+                            const updated = prompts.map(pp => pp.id === p.id ? { ...pp, text: e.target.value } : pp);
+                            setPrompts(updated);
+                            savePrompts(updated);
+                            setEditingPrompt(null);
+                          }}
+                          autoFocus
+                          rows={5}
+                          className="w-full text-xs text-foreground bg-background/50 border border-primary/30 rounded-lg px-3 py-2 resize-none outline-none focus:border-primary/60 font-mono"
+                        />
+                      ) : (
+                        <p className="text-[11px] text-muted-foreground leading-relaxed line-clamp-3">{p.text}</p>
+                      )}
+                    </div>
+                    <button onClick={() => setEditingPrompt(editingPrompt === p.id ? null : p.id)}
+                      className="text-muted-foreground hover:text-foreground transition-colors flex-shrink-0 mt-0.5"
+                      title="Редактировать текст промпта">
+                      <Icon name={editingPrompt === p.id ? "Check" : "Pencil"} size={13} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {/* Добавить свой промпт */}
+              <button onClick={() => {
+                const newP: PromptPreset = {
+                  id: crypto.randomUUID(),
+                  label: "Новый промпт",
+                  text: "",
+                  enabled: true,
+                };
+                const updated = [...prompts, newP];
+                setPrompts(updated);
+                savePrompts(updated);
+                setEditingPrompt(newP.id);
+              }} className="w-full py-2.5 rounded-xl border border-dashed border-border/40 text-xs text-muted-foreground hover:text-foreground hover:border-primary/30 transition-all flex items-center justify-center gap-2">
+                <Icon name="Plus" size={13} />
+                Добавить свой промпт
+              </button>
+            </div>
+
+            <div className="px-5 py-3 border-t border-border/40 flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">
+                {prompts.filter(p => p.enabled).length > 0
+                  ? `Подключено: ${prompts.filter(p => p.enabled).map(p => p.label).join(", ")}`
+                  : "Ни один промпт не подключён — ИИ работает в базовом режиме"}
+              </p>
+              <button onClick={() => setPromptsOpen(false)}
+                className="px-4 py-1.5 rounded-lg text-xs btn-primary">
+                Готово
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
