@@ -6,8 +6,9 @@ import Icon from "@/components/ui/icon";
 import mammoth from "mammoth";
 import {
   saveSession, loadSession, listSessions, deleteSession,
-  saveKnowledge, loadKnowledge, formatKnowledgeForAI,
-  type SavedSession, type KnowledgeEntry,
+  saveKnowledge, loadKnowledge, formatKnowledgeForAI, getKnowledgePdfImages,
+  OIL_KNOWLEDGE_TEMPLATES, KNOWLEDGE_CATEGORIES,
+  type SavedSession, type KnowledgeEntry, type KnowledgeCategory, type KnowledgeSourceType,
 } from "@/lib/session-db";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -956,7 +957,7 @@ async function callAi(
 
   const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}\n\nОтветь ТОЛЬКО JSON.`;
 
-  // Собираем все изображения: пользовательские скриншоты + страницы PDF
+  // Собираем все изображения: скриншоты + PDF рабочих документов + PDF из базы знаний
   type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
   const allImageParts: ContentPart[] = [];
   for (const img of images) {
@@ -964,6 +965,12 @@ async function callAi(
   }
   for (const url of pdfImageUrls) {
     allImageParts.push({ type: "image_url", image_url: { url } });
+  }
+  // PDF из базы знаний
+  for (const kbPdf of getKnowledgePdfImages(knowledgeEntries)) {
+    for (const url of kbPdf.urls) {
+      allImageParts.push({ type: "image_url", image_url: { url } });
+    }
   }
 
   let userContent: string | ContentPart[];
@@ -1344,20 +1351,30 @@ export default function Index() {
   const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
   const docInputRef = useRef<HTMLInputElement>(null);
   const knowledgeTxtRef = useRef<HTMLInputElement>(null);
+  const knowledgeFileRef = useRef<HTMLInputElement>(null); // Excel/PDF/DOCX в базу знаний
 
   // База знаний
   const [knowledge, setKnowledge] = useState<KnowledgeEntry[]>([]);
   const [knowledgeOpen, setKnowledgeOpen] = useState(false);
   const [editingKbId, setEditingKbId] = useState<string | null>(null);
+  const [kbCategoryFilter, setKbCategoryFilter] = useState<KnowledgeCategory | "all">("all");
+  const [kbLoadingId, setKbLoadingId] = useState<string | null>(null);
 
   // Сессия
   const [sessionOpen, setSessionOpen] = useState(false);
   const [savedSessions, setSavedSessions] = useState<Pick<SavedSession, "id" | "name" | "savedAt">[]>([]);
   const [sessionSaving, setSessionSaving] = useState(false);
 
-  // Загружаем базу знаний из IndexedDB при старте
+  // Загружаем базу знаний из IndexedDB при старте (с миграцией старых записей)
   useEffect(() => {
-    loadKnowledge().then(setKnowledge).catch(() => {});
+    loadKnowledge().then(entries => {
+      const migrated = entries.map(e => ({
+        ...e,
+        category: e.category ?? "custom",
+        sourceType: e.sourceType ?? "text",
+      } as KnowledgeEntry));
+      setKnowledge(migrated);
+    }).catch(() => {});
   }, []);
 
   // Автосохранение сессии каждые 60 секунд
@@ -2521,11 +2538,87 @@ export default function Index() {
           const newEntries: KnowledgeEntry[] = [];
           for (const f of Array.from(e.target.files)) {
             const text = await f.text();
-            newEntries.push({ id: crypto.randomUUID(), title: f.name.replace(/\.[^.]+$/, ""), content: text, enabled: true, updatedAt: Date.now() });
+            newEntries.push({
+              id: crypto.randomUUID(), title: f.name.replace(/\.[^.]+$/, ""),
+              content: text, category: "custom", sourceType: "text",
+              enabled: true, updatedAt: Date.now(), fileName: f.name,
+            });
           }
           const updated = [...knowledge, ...newEntries];
-          setKnowledge(updated);
-          await saveKnowledge(updated);
+          setKnowledge(updated); await saveKnowledge(updated);
+          e.target.value = "";
+        }} />
+
+      {/* Файлы в базу знаний: Excel / PDF / DOCX */}
+      <input ref={knowledgeFileRef} type="file" accept=".xlsx,.xls,.csv,.docx,.pdf" multiple className="hidden"
+        onChange={async (e) => {
+          if (!e.target.files) return;
+          for (const f of Array.from(e.target.files)) {
+            const id = crypto.randomUUID();
+            const title = f.name.replace(/\.[^.]+$/, "");
+            const isPdf = f.name.match(/\.pdf$/i);
+            const isDocx = f.name.match(/\.docx$/i);
+            const isExcel = f.name.match(/\.(xlsx|xls|csv)$/i);
+            const sourceType: KnowledgeSourceType = isPdf ? "pdf" : isDocx ? "docx" : "excel";
+
+            if (isPdf) {
+              // PDF → конвертируем через бэкенд
+              setKbLoadingId(id);
+              const placeholder: KnowledgeEntry = {
+                id, title, content: "Загрузка...", category: "docs",
+                sourceType: "pdf", enabled: false, updatedAt: Date.now(), fileName: f.name,
+              };
+              const updatedPlaceholder = [...knowledge, placeholder];
+              setKnowledge(updatedPlaceholder);
+
+              const buf = await f.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              let binary = "";
+              for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+              const pdf_b64 = btoa(binary);
+              const resp = await fetch(AI_EXCEL_URL, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "pdf_to_images", pdf_b64, dpi: 150, max_pages: 80 }),
+              });
+              const result = await resp.json() as { page_urls: string[]; total_pages: number };
+              const entry: KnowledgeEntry = {
+                id, title, content: `PDF «${f.name}»: ${result.total_pages} стр. Передаётся ИИ как изображения страниц.`,
+                category: "docs", sourceType: "pdf", enabled: true, updatedAt: Date.now(),
+                fileName: f.name, pageImageUrls: result.page_urls, pageCount: result.total_pages,
+              };
+              const updated = knowledge.filter(k => k.id !== id).concat(entry);
+              setKnowledge(updated); await saveKnowledge(updated);
+              setKbLoadingId(null);
+
+            } else if (isDocx) {
+              const buf = await f.arrayBuffer();
+              const textResult = await mammoth.extractRawText({ arrayBuffer: buf });
+              const entry: KnowledgeEntry = {
+                id, title, content: textResult.value, category: "docs",
+                sourceType: "docx", enabled: true, updatedAt: Date.now(), fileName: f.name,
+              };
+              const updated = [...knowledge, entry];
+              setKnowledge(updated); await saveKnowledge(updated);
+
+            } else if (isExcel) {
+              const buf = await f.arrayBuffer();
+              const wb = XLSX.read(buf, { type: "array" });
+              const lines: string[] = [`Excel-файл: ${f.name}`];
+              wb.SheetNames.forEach(shName => {
+                const ws = wb.Sheets[shName];
+                const rows = XLSX.utils.sheet_to_json<string[]>(ws, { header: 1, defval: "" }) as string[][];
+                lines.push(`\n--- Лист «${shName}» ---`);
+                rows.slice(0, 200).forEach(row => lines.push(row.join("\t")));
+                if (rows.length > 200) lines.push(`[... ещё ${rows.length - 200} строк]`);
+              });
+              const entry: KnowledgeEntry = {
+                id, title, content: lines.join("\n"), category: "tables",
+                sourceType: "excel", enabled: true, updatedAt: Date.now(), fileName: f.name,
+              };
+              const updated = [...knowledge, entry];
+              setKnowledge(updated); await saveKnowledge(updated);
+            }
+          }
           e.target.value = "";
         }} />
 
@@ -2617,111 +2710,282 @@ export default function Index() {
       )}
 
       {/* ── Knowledge Base Modal ── */}
-      {knowledgeOpen && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center pt-12 px-4" style={{ background: "rgba(0,0,0,0.75)" }}
-          onClick={(e) => { if (e.target === e.currentTarget) setKnowledgeOpen(false); }}>
-          <div className="w-full max-w-2xl rounded-2xl border border-amber-400/30 flex flex-col max-h-[85vh]"
-            style={{ background: "hsl(220,14%,8%)" }}>
+      {knowledgeOpen && (() => {
+        const filtered = kbCategoryFilter === "all"
+          ? knowledge
+          : knowledge.filter(k => k.category === kbCategoryFilter);
+        const activeCount = knowledge.filter(k => k.enabled).length;
+        const catCounts = Object.fromEntries(
+          (Object.keys(KNOWLEDGE_CATEGORIES) as KnowledgeCategory[]).map(c => [c, knowledge.filter(k => k.category === c).length])
+        );
 
-            <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3">
-              <Icon name="BookOpen" size={16} className="text-amber-400" />
-              <div className="flex-1">
-                <h2 className="font-semibold text-sm text-foreground">База знаний проекта</h2>
-                <p className="text-[11px] text-muted-foreground">Термины, правила интерпретации, словари — ИИ всегда учитывает при ответах</p>
-              </div>
-              <button onClick={() => setKnowledgeOpen(false)} className="text-muted-foreground hover:text-foreground">
-                <Icon name="X" size={16} />
-              </button>
-            </div>
+        // Иконка источника
+        const srcIcon = (t: KnowledgeSourceType) =>
+          t === "pdf" ? "FileText" : t === "docx" ? "FileEdit" : t === "excel" ? "FileSpreadsheet" : "AlignLeft";
 
-            <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-2">
-              {knowledge.length === 0 && (
-                <div className="text-center py-8 text-muted-foreground">
-                  <Icon name="BookOpen" size={32} className="mx-auto mb-3 opacity-30" />
-                  <p className="text-sm">База знаний пуста</p>
-                  <p className="text-xs mt-1">Добавь правила, термины и словари — ИИ будет их всегда учитывать</p>
+        return (
+          <div className="fixed inset-0 z-50 flex items-start justify-center pt-6 px-3 pb-3"
+            style={{ background: "rgba(0,0,0,0.8)" }}
+            onClick={(e) => { if (e.target === e.currentTarget) setKnowledgeOpen(false); }}>
+            <div className="w-full max-w-3xl rounded-2xl border border-amber-400/25 flex flex-col"
+              style={{ background: "hsl(220,14%,8%)", maxHeight: "calc(100vh - 48px)" }}>
+
+              {/* ── Header ── */}
+              <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3 flex-shrink-0">
+                <Icon name="BookOpen" size={16} className="text-amber-400" />
+                <div className="flex-1">
+                  <h2 className="font-semibold text-sm text-foreground">База знаний проекта</h2>
+                  <p className="text-[11px] text-muted-foreground">Галочкой включаешь что ИИ знает. Меняй состав под каждый проект.</p>
                 </div>
-              )}
-              {knowledge.map((k) => (
-                <div key={k.id} className={`rounded-xl border transition-all ${k.enabled ? "border-amber-400/30 bg-amber-400/5" : "border-border/40"}`}>
-                  <div className="flex items-start gap-3 p-3">
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {knowledge.length === 0 && (
                     <button onClick={async () => {
-                      const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, enabled: !kk.enabled } : kk);
-                      setKnowledge(updated);
-                      await saveKnowledge(updated);
-                    }} className={`w-5 h-5 rounded flex items-center justify-center flex-shrink-0 mt-0.5 border-2 transition-all ${k.enabled ? "bg-amber-400 border-amber-400" : "border-border/60 hover:border-amber-400/50"}`}>
-                      {k.enabled && <Icon name="Check" size={11} className="text-black" />}
+                      const entries: KnowledgeEntry[] = OIL_KNOWLEDGE_TEMPLATES.map(t => ({
+                        ...t, id: crypto.randomUUID(), updatedAt: Date.now(),
+                      }));
+                      const updated = [...knowledge, ...entries];
+                      setKnowledge(updated); await saveKnowledge(updated);
+                    }} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-amber-400/15 text-amber-400 border border-amber-400/30 hover:bg-amber-400/25 transition-all">
+                      <Icon name="Sparkles" size={12} /> Загрузить шаблоны нефтяной отрасли
                     </button>
-                    <div className="flex-1 min-w-0">
-                      {editingKbId === k.id ? (
-                        <>
-                          <input defaultValue={k.title} onBlur={async (e) => {
-                            const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, title: e.target.value } : kk);
-                            setKnowledge(updated);
-                            await saveKnowledge(updated);
-                          }} className="w-full text-xs font-semibold text-foreground bg-background/50 border border-amber-400/30 rounded px-2 py-0.5 outline-none mb-1" />
-                          <textarea defaultValue={k.content} rows={6}
-                            onBlur={async (e) => {
-                              const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, content: e.target.value, updatedAt: Date.now() } : kk);
-                              setKnowledge(updated);
-                              await saveKnowledge(updated);
-                              setEditingKbId(null);
-                            }}
-                            autoFocus
-                            className="w-full text-xs text-foreground bg-background/50 border border-amber-400/30 rounded-lg px-3 py-2 resize-none outline-none focus:border-amber-400/60 font-mono" />
-                        </>
-                      ) : (
-                        <>
-                          <p className="text-xs font-semibold text-amber-300 mb-1">{k.title}</p>
-                          <p className="text-[11px] text-muted-foreground leading-relaxed line-clamp-3 whitespace-pre-wrap">{k.content}</p>
-                        </>
-                      )}
-                    </div>
-                    <div className="flex flex-col gap-1 flex-shrink-0">
-                      <button onClick={() => setEditingKbId(editingKbId === k.id ? null : k.id)}
-                        className="text-muted-foreground hover:text-foreground transition-colors" title="Редактировать">
-                        <Icon name={editingKbId === k.id ? "Check" : "Pencil"} size={13} />
-                      </button>
-                      <button onClick={async () => {
-                        const updated = knowledge.filter(kk => kk.id !== k.id);
-                        setKnowledge(updated);
-                        await saveKnowledge(updated);
-                      }} className="text-muted-foreground hover:text-red-400 transition-colors" title="Удалить">
-                        <Icon name="Trash2" size={13} />
-                      </button>
-                    </div>
-                  </div>
+                  )}
+                  <button onClick={() => setKnowledgeOpen(false)} className="text-muted-foreground hover:text-foreground p-1">
+                    <Icon name="X" size={16} />
+                  </button>
                 </div>
-              ))}
+              </div>
 
-              <div className="flex gap-2 pt-1">
+              {/* ── Кнопки загрузки ── */}
+              <div className="px-4 py-3 border-b border-border/30 flex flex-wrap gap-2 flex-shrink-0"
+                style={{ background: "rgba(255,255,255,0.01)" }}>
                 <button onClick={() => {
-                  const newK: KnowledgeEntry = { id: crypto.randomUUID(), title: "Новое правило", content: "", enabled: true, updatedAt: Date.now() };
-                  const updated = [...knowledge, newK];
-                  setKnowledge(updated);
-                  saveKnowledge(updated);
+                  const newK: KnowledgeEntry = {
+                    id: crypto.randomUUID(), title: "Новое правило", content: "",
+                    category: "custom", sourceType: "text", enabled: true, updatedAt: Date.now(),
+                  };
+                  setKnowledge(prev => { const u = [...prev, newK]; saveKnowledge(u); return u; });
                   setEditingKbId(newK.id);
-                }} className="flex-1 py-2.5 rounded-xl border border-dashed border-border/40 text-xs text-muted-foreground hover:text-foreground hover:border-amber-400/30 transition-all flex items-center justify-center gap-2">
-                  <Icon name="Plus" size={13} /> Добавить вручную
+                }} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border border-border/50 text-muted-foreground hover:text-foreground hover:border-amber-400/40 transition-all">
+                  <Icon name="Plus" size={12} /> Написать правило
                 </button>
                 <button onClick={() => knowledgeTxtRef.current?.click()}
-                  className="flex-1 py-2.5 rounded-xl border border-dashed border-border/40 text-xs text-muted-foreground hover:text-foreground hover:border-amber-400/30 transition-all flex items-center justify-center gap-2">
-                  <Icon name="Upload" size={13} /> Загрузить .txt / .md
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border border-border/50 text-muted-foreground hover:text-foreground hover:border-amber-400/40 transition-all">
+                  <Icon name="FileText" size={12} /> .txt / .md
                 </button>
+                <button onClick={() => knowledgeFileRef.current?.click()}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border border-border/50 text-muted-foreground hover:text-foreground hover:border-amber-400/40 transition-all">
+                  <Icon name="Upload" size={12} /> Excel / Word / PDF
+                  {kbLoadingId && <Icon name="Loader2" size={11} className="spinner text-amber-400" />}
+                </button>
+                {knowledge.length > 0 && (
+                  <button onClick={async () => {
+                    const entries: KnowledgeEntry[] = OIL_KNOWLEDGE_TEMPLATES.map(t => ({
+                      ...t, id: crypto.randomUUID(), updatedAt: Date.now(),
+                    }));
+                    const existTitles = new Set(knowledge.map(k => k.title));
+                    const toAdd = entries.filter(e => !existTitles.has(e.title));
+                    if (!toAdd.length) return;
+                    const updated = [...knowledge, ...toAdd];
+                    setKnowledge(updated); await saveKnowledge(updated);
+                  }} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border border-amber-400/20 text-amber-400/70 hover:text-amber-400 hover:border-amber-400/40 transition-all ml-auto">
+                    <Icon name="Sparkles" size={12} /> + шаблоны
+                  </button>
+                )}
+              </div>
+
+              {/* ── Категории-фильтры ── */}
+              <div className="px-4 py-2 border-b border-border/20 flex gap-1.5 overflow-x-auto scrollbar-thin flex-shrink-0">
+                <button onClick={() => setKbCategoryFilter("all")}
+                  className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] whitespace-nowrap transition-all flex-shrink-0 ${kbCategoryFilter === "all" ? "bg-amber-400/20 text-amber-300 border border-amber-400/30" : "text-muted-foreground hover:text-foreground border border-transparent hover:border-border/40"}`}>
+                  Все ({knowledge.length})
+                </button>
+                {(Object.entries(KNOWLEDGE_CATEGORIES) as [KnowledgeCategory, typeof KNOWLEDGE_CATEGORIES[KnowledgeCategory]][]).map(([cat, meta]) =>
+                  catCounts[cat] > 0 && (
+                    <button key={cat} onClick={() => setKbCategoryFilter(cat)}
+                      className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] whitespace-nowrap transition-all flex-shrink-0 ${kbCategoryFilter === cat ? "bg-amber-400/20 text-amber-300 border border-amber-400/30" : "text-muted-foreground hover:text-foreground border border-transparent hover:border-border/40"}`}>
+                      <Icon name={meta.icon as Parameters<typeof Icon>[0]["name"]} size={11} className={meta.color} />
+                      {meta.label} ({catCounts[cat]})
+                    </button>
+                  )
+                )}
+              </div>
+
+              {/* ── Список записей ── */}
+              <div className="flex-1 overflow-y-auto scrollbar-thin p-3 space-y-1.5 min-h-0">
+                {filtered.length === 0 && (
+                  <div className="text-center py-10 text-muted-foreground">
+                    <Icon name="BookOpen" size={28} className="mx-auto mb-2 opacity-20" />
+                    <p className="text-sm">
+                      {knowledge.length === 0
+                        ? "База знаний пуста — нажми «Загрузить шаблоны»"
+                        : "В этой категории пусто"}
+                    </p>
+                  </div>
+                )}
+                {filtered.map((k) => {
+                  const catMeta = KNOWLEDGE_CATEGORIES[k.category ?? "custom"];
+                  const isLoading = kbLoadingId === k.id;
+                  return (
+                    <div key={k.id}
+                      className={`rounded-xl border transition-all ${k.enabled ? "border-amber-400/35 bg-amber-400/5" : "border-border/30 opacity-60 hover:opacity-80"}`}>
+                      <div className="flex items-start gap-2.5 p-3">
+                        {/* Чекбокс */}
+                        <button onClick={async () => {
+                          const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, enabled: !kk.enabled } : kk);
+                          setKnowledge(updated); await saveKnowledge(updated);
+                        }} className={`w-5 h-5 rounded flex items-center justify-center flex-shrink-0 mt-0.5 border-2 transition-all ${k.enabled ? "bg-amber-400 border-amber-400" : "border-border/60 hover:border-amber-400/60"}`}>
+                          {k.enabled && <Icon name="Check" size={10} className="text-black" />}
+                        </button>
+
+                        <div className="flex-1 min-w-0">
+                          {/* Заголовок + мета */}
+                          <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
+                            <Icon name={srcIcon(k.sourceType ?? "text") as Parameters<typeof Icon>[0]["name"]} size={11} className="text-muted-foreground flex-shrink-0" />
+                            {editingKbId === k.id ? (
+                              <input defaultValue={k.title} autoFocus
+                                onBlur={async (e) => {
+                                  const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, title: e.target.value } : kk);
+                                  setKnowledge(updated); await saveKnowledge(updated);
+                                }}
+                                className="flex-1 text-xs font-semibold text-foreground bg-background/50 border border-amber-400/40 rounded px-2 py-0.5 outline-none" />
+                            ) : (
+                              <span className="text-xs font-semibold text-amber-200 truncate">{k.title}</span>
+                            )}
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded-full border flex-shrink-0 ${catMeta.color} border-current/20 bg-current/5`}
+                              style={{ opacity: 0.8 }}>{catMeta.label}</span>
+                            {k.fileName && (
+                              <span className="text-[10px] text-muted-foreground truncate max-w-[120px]">{k.fileName}</span>
+                            )}
+                            {isLoading && <Icon name="Loader2" size={11} className="spinner text-amber-400 flex-shrink-0" />}
+                          </div>
+
+                          {/* Категория (select при редактировании) */}
+                          {editingKbId === k.id && (
+                            <select value={k.category ?? "custom"}
+                              onChange={async (e) => {
+                                const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, category: e.target.value as KnowledgeCategory } : kk);
+                                setKnowledge(updated); await saveKnowledge(updated);
+                              }}
+                              className="mb-1.5 text-[11px] bg-secondary border border-border/60 text-foreground rounded px-2 py-0.5 outline-none">
+                              {(Object.entries(KNOWLEDGE_CATEGORIES) as [KnowledgeCategory, typeof KNOWLEDGE_CATEGORIES[KnowledgeCategory]][]).map(([cat, meta]) => (
+                                <option key={cat} value={cat}>{meta.label}</option>
+                              ))}
+                            </select>
+                          )}
+
+                          {/* Содержимое */}
+                          {k.sourceType === "pdf" && k.pageImageUrls?.length ? (
+                            <div className="space-y-1.5">
+                              <p className="text-[11px] text-muted-foreground">
+                                {k.pageImageUrls.length} стр. → ИИ видит как изображения
+                              </p>
+                              {/* Диапазон страниц */}
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-[11px] text-muted-foreground">Страницы для ИИ:</span>
+                                <input type="number" min={1} max={k.pageImageUrls.length}
+                                  value={k.pageFrom ?? ""} placeholder="1"
+                                  onChange={async (e) => {
+                                    const updated = knowledge.map(kk => kk.id === k.id
+                                      ? { ...kk, pageFrom: e.target.value ? parseInt(e.target.value) : undefined } : kk);
+                                    setKnowledge(updated); await saveKnowledge(updated);
+                                  }}
+                                  className="w-14 text-[11px] bg-secondary border border-border/60 text-foreground rounded px-1.5 py-0.5 outline-none text-center" />
+                                <span className="text-[11px] text-muted-foreground">—</span>
+                                <input type="number" min={1} max={k.pageImageUrls.length}
+                                  value={k.pageTo ?? ""} placeholder={String(k.pageImageUrls.length)}
+                                  onChange={async (e) => {
+                                    const updated = knowledge.map(kk => kk.id === k.id
+                                      ? { ...kk, pageTo: e.target.value ? parseInt(e.target.value) : undefined } : kk);
+                                    setKnowledge(updated); await saveKnowledge(updated);
+                                  }}
+                                  className="w-14 text-[11px] bg-secondary border border-border/60 text-foreground rounded px-1.5 py-0.5 outline-none text-center" />
+                                <span className="text-[11px] text-muted-foreground">из {k.pageImageUrls.length}</span>
+                              </div>
+                              {/* Миниатюры первых 4 страниц */}
+                              <div className="flex gap-1.5 mt-1">
+                                {k.pageImageUrls.slice(0, 4).map((url, pi) => (
+                                  <img key={pi} src={url} alt={`стр.${pi+1}`}
+                                    className="h-14 w-10 object-cover rounded border border-border/40 bg-white cursor-pointer"
+                                    onClick={() => window.open(url, "_blank")} />
+                                ))}
+                                {k.pageImageUrls.length > 4 && (
+                                  <div className="h-14 w-10 rounded border border-border/40 bg-secondary flex items-center justify-center text-[10px] text-muted-foreground">
+                                    +{k.pageImageUrls.length - 4}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ) : editingKbId === k.id ? (
+                            <textarea defaultValue={k.content} rows={5}
+                              onBlur={async (e) => {
+                                const updated = knowledge.map(kk => kk.id === k.id
+                                  ? { ...kk, content: e.target.value, updatedAt: Date.now() } : kk);
+                                setKnowledge(updated); await saveKnowledge(updated);
+                                setEditingKbId(null);
+                              }}
+                              className="w-full mt-1 text-[11px] text-foreground bg-background/60 border border-amber-400/30 rounded-lg px-3 py-2 resize-none outline-none focus:border-amber-400/60 font-mono leading-relaxed" />
+                          ) : (
+                            <p className="text-[11px] text-muted-foreground leading-relaxed line-clamp-2 whitespace-pre-wrap mt-0.5">{k.content}</p>
+                          )}
+                        </div>
+
+                        {/* Действия */}
+                        <div className="flex flex-col gap-1 flex-shrink-0 mt-0.5">
+                          {k.sourceType !== "pdf" && (
+                            <button onClick={() => setEditingKbId(editingKbId === k.id ? null : k.id)}
+                              className="w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-secondary transition-all"
+                              title="Редактировать">
+                              <Icon name={editingKbId === k.id ? "Check" : "Pencil"} size={12} />
+                            </button>
+                          )}
+                          <button onClick={async () => {
+                            const updated = knowledge.filter(kk => kk.id !== k.id);
+                            setKnowledge(updated); await saveKnowledge(updated);
+                          }} className="w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-red-400 hover:bg-red-400/10 transition-all"
+                            title="Удалить">
+                            <Icon name="Trash2" size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* ── Footer ── */}
+              <div className="px-5 py-3 border-t border-border/40 flex items-center justify-between gap-3 flex-shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className={`text-[11px] font-medium ${activeCount > 0 ? "text-amber-400" : "text-muted-foreground"}`}>
+                    {activeCount > 0 ? `Активно ${activeCount} из ${knowledge.length}` : "Ничего не активно"}
+                  </span>
+                  {activeCount > 0 && (
+                    <span className="text-[11px] text-muted-foreground truncate hidden sm:block">
+                      — {knowledge.filter(k => k.enabled).map(k => k.title).join(", ")}
+                    </span>
+                  )}
+                </div>
+                <div className="flex gap-2 flex-shrink-0">
+                  <button onClick={async () => {
+                    const updated = knowledge.map(k => ({ ...k, enabled: true }));
+                    setKnowledge(updated); await saveKnowledge(updated);
+                  }} className="px-3 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground border border-border/40 hover:border-border/70 transition-all">
+                    Все вкл.
+                  </button>
+                  <button onClick={async () => {
+                    const updated = knowledge.map(k => ({ ...k, enabled: false }));
+                    setKnowledge(updated); await saveKnowledge(updated);
+                  }} className="px-3 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground border border-border/40 hover:border-border/70 transition-all">
+                    Все выкл.
+                  </button>
+                  <button onClick={() => setKnowledgeOpen(false)} className="px-4 py-1.5 rounded-lg text-xs btn-primary">
+                    Готово
+                  </button>
+                </div>
               </div>
             </div>
-
-            <div className="px-5 py-3 border-t border-border/40 flex items-center justify-between">
-              <p className="text-xs text-muted-foreground">
-                {knowledge.filter(k => k.enabled).length > 0
-                  ? `Активно: ${knowledge.filter(k => k.enabled).map(k => k.title).join(", ")}`
-                  : "Ничего не активно — ИИ не получает дополнительного контекста"}
-              </p>
-              <button onClick={() => setKnowledgeOpen(false)} className="px-4 py-1.5 rounded-lg text-xs btn-primary">Готово</button>
-            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* ── Session Modal ── */}
       {sessionOpen && (
