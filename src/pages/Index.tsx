@@ -4,6 +4,11 @@ import * as XLSX from "xlsx";
 import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid } from "recharts";
 import Icon from "@/components/ui/icon";
 import mammoth from "mammoth";
+import {
+  saveSession, loadSession, listSessions, deleteSession,
+  saveKnowledge, loadKnowledge, formatKnowledgeForAI,
+  type SavedSession, type KnowledgeEntry,
+} from "@/lib/session-db";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -79,6 +84,9 @@ interface DocFile {
   pageCount?: number;
   pageImageUrls?: string[]; // PDF: URL PNG-изображений страниц (для ИИ)
   loading?: boolean;        // PDF: идёт конвертация
+  pageFrom?: number;        // диапазон страниц для ИИ (1-based)
+  pageTo?: number;
+  buffer?: ArrayBuffer;     // оригинальный файл для сохранения в сессии
 }
 
 // Промпты с галочками
@@ -879,7 +887,9 @@ async function callAi(
   settings: AiSettings,
   images: ChatImage[],
   docs: DocFile[],
-  activePrompts: PromptPreset[]
+  activePrompts: PromptPreset[],
+  history: ChatMessage[],
+  knowledgeEntries: KnowledgeEntry[]
 ): Promise<{
   text: string;
   mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[];
@@ -922,33 +932,36 @@ async function callAi(
     contextParts.push(text);
   });
 
-  // PDF-страницы — собираем URL для передачи как изображения
+  // PDF-страницы — собираем URL с учётом диапазона
   const pdfImageUrls: string[] = [];
   docs.filter(d => d.type === "pdf" && d.pageImageUrls && d.pageImageUrls.length > 0).forEach((doc) => {
     const roleLabel = doc.role ? ` [${doc.role.toUpperCase()}]` : "";
-    contextParts.push(`=== PDF-документ «${doc.name}»${roleLabel} (${doc.pageCount} стр.) — страницы переданы как изображения ниже ===`);
-    pdfImageUrls.push(...(doc.pageImageUrls ?? []));
+    const allUrls = doc.pageImageUrls ?? [];
+    const from = Math.max(1, doc.pageFrom ?? 1);
+    const to = Math.min(allUrls.length, doc.pageTo ?? allUrls.length);
+    const selectedUrls = allUrls.slice(from - 1, to);
+    const rangeNote = (doc.pageFrom || doc.pageTo) ? ` стр.${from}–${to}` : ` все ${allUrls.length} стр.`;
+    contextParts.push(`=== PDF «${doc.name}»${roleLabel} (${doc.pageCount} стр.,${rangeNote} в контексте) ===`);
+    pdfImageUrls.push(...selectedUrls);
   });
 
   const fullContext = contextParts.join("\n");
   (window as Window & { __datamind_last_context?: string }).__datamind_last_context = fullContext;
 
-  // Активные промпты добавляем в системный промпт
+  // База знаний + активные промпты → системный промпт
+  const knowledgeText = formatKnowledgeForAI(knowledgeEntries);
   const activePromptsText = activePrompts.filter(p => p.enabled).map(p => p.text).join("\n\n");
-  const effectiveSystemPrompt = activePromptsText
-    ? `${activePromptsText}\n\n---\n\n${SYSTEM_PROMPT}`
-    : SYSTEM_PROMPT;
+  const effectiveSystemPrompt = [knowledgeText, activePromptsText, SYSTEM_PROMPT]
+    .filter(Boolean).join("\n\n---\n\n");
 
   const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}\n\nОтветь ТОЛЬКО JSON.`;
 
   // Собираем все изображения: пользовательские скриншоты + страницы PDF
   type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
   const allImageParts: ContentPart[] = [];
-  // Пользовательские картинки (base64)
   for (const img of images) {
     allImageParts.push({ type: "image_url", image_url: { url: img.dataUrl } });
   }
-  // PDF-страницы (CDN URL)
   for (const url of pdfImageUrls) {
     allImageParts.push({ type: "image_url", image_url: { url } });
   }
@@ -958,6 +971,13 @@ async function callAi(
     userContent = [{ type: "text", text: textBlock } as ContentPart, ...allImageParts];
   } else {
     userContent = textBlock;
+  }
+
+  // История переписки — последние 6 пар (user+ai), без images чтобы не раздувать контекст
+  const historyMessages: { role: "user" | "assistant"; content: string }[] = [];
+  const recentHistory = history.slice(-12).filter(m => m.role === "user" || m.role === "ai");
+  for (const m of recentHistory) {
+    historyMessages.push({ role: m.role === "ai" ? "assistant" : "user", content: m.text });
   }
 
   // Если есть PDF-картинки — форсируем vision-модель
@@ -977,6 +997,7 @@ async function callAi(
       model: finalModel,
       messages: [
         { role: "system", content: effectiveSystemPrompt },
+        ...historyMessages,
         { role: "user", content: userContent },
       ],
       max_tokens: 4000,
@@ -1322,6 +1343,32 @@ export default function Index() {
   const [prompts, setPrompts] = useState<PromptPreset[]>(loadPrompts);
   const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
   const docInputRef = useRef<HTMLInputElement>(null);
+  const knowledgeTxtRef = useRef<HTMLInputElement>(null);
+
+  // База знаний
+  const [knowledge, setKnowledge] = useState<KnowledgeEntry[]>([]);
+  const [knowledgeOpen, setKnowledgeOpen] = useState(false);
+  const [editingKbId, setEditingKbId] = useState<string | null>(null);
+
+  // Сессия
+  const [sessionOpen, setSessionOpen] = useState(false);
+  const [savedSessions, setSavedSessions] = useState<Pick<SavedSession, "id" | "name" | "savedAt">[]>([]);
+  const [sessionSaving, setSessionSaving] = useState(false);
+
+  // Загружаем базу знаний из IndexedDB при старте
+  useEffect(() => {
+    loadKnowledge().then(setKnowledge).catch(() => {});
+  }, []);
+
+  // Автосохранение сессии каждые 60 секунд
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (files.length === 0 && docs.length === 0) return;
+      doSaveSession("current", "Автосохранение").catch(() => {});
+    }, 60_000);
+    return () => clearInterval(timer);
+   
+  }, [files, docs, messages]);
 
   // Сохраняем в window при каждом изменении
   useEffect(() => { window.__datamind_files = files; }, [files]);
@@ -1335,6 +1382,88 @@ export default function Index() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
+
+  // ── Session save/load ──
+  const doSaveSession = useCallback(async (id: string, name: string) => {
+    setSessionSaving(true);
+    try {
+      const excelFiles = await Promise.all(files.map(async (f) => {
+        const wb = f.workbook;
+        const buf = XLSX.write(wb, { bookType: "xlsx", type: "array", cellStyles: true }) as ArrayBuffer;
+        return {
+          id: f.id, name: f.name, role: f.role,
+          activeSheet: f.activeSheet, buffer: buf,
+        };
+      }));
+
+      const docFiles = docs.map(d => ({
+        id: d.id, name: d.name, type: d.type, role: d.role,
+        text: d.text, html: d.html, pageCount: d.pageCount,
+        pageImageUrls: d.pageImageUrls,
+        buffer: d.buffer,
+      }));
+
+      const session: SavedSession = {
+        id, name, savedAt: Date.now(),
+        excelFiles, docFiles,
+        knowledgeBase: knowledge,
+        messages: messages.slice(-30).map(m => ({ role: m.role, text: m.text, ts: m.ts })),
+      };
+      await saveSession(session);
+    } finally {
+      setSessionSaving(false);
+    }
+   
+  }, [files, docs, knowledge, messages]);
+
+  const doLoadSession = useCallback(async (id: string) => {
+    const session = await loadSession(id);
+    if (!session) return;
+
+    // Восстанавливаем Excel
+    const excelFiles = session.excelFiles.map((sf) => {
+      const wb = XLSX.read(sf.buffer, { type: "array", cellStyles: true });
+      const sheets = wb.SheetNames.map(name => {
+        const ws = wb.Sheets[name];
+        const raw = XLSX.utils.sheet_to_json<(string | number | null)[]>(ws, { header: 1, defval: null }) as (string | number | null)[][];
+        const ROWS = Math.max(raw.length + 20, 50);
+        const COLS = Math.max(...raw.map(r => r.length), 10);
+        const cells = Array.from({ length: ROWS }, (_, ri) =>
+          Array.from({ length: COLS }, (_, ci) => ({ v: raw[ri]?.[ci] ?? null }))
+        );
+        return { name, cells, merges: [], colWidths: Array(COLS).fill(100), rowHeights: Array(ROWS).fill(22) };
+      });
+      return { id: sf.id, name: sf.name, role: sf.role, sheets, activeSheet: sf.activeSheet, workbook: wb, isDirty: false };
+    });
+
+    setFiles(excelFiles);
+    if (excelFiles.length) setActiveFileId(excelFiles[0].id);
+
+    // Восстанавливаем документы
+    const docFiles: DocFile[] = session.docFiles.map(df => ({
+      id: df.id, name: df.name, type: df.type, role: df.role,
+      text: df.text, html: df.html, pageCount: df.pageCount,
+      pageImageUrls: df.pageImageUrls, buffer: df.buffer,
+    }));
+    setDocs(docFiles);
+
+    // Восстанавливаем базу знаний
+    if (session.knowledgeBase?.length) {
+      setKnowledge(session.knowledgeBase);
+      await saveKnowledge(session.knowledgeBase);
+    }
+
+    // Восстанавливаем последние сообщения
+    if (session.messages?.length) {
+      setMessages(session.messages.map(m => ({ ...m, refs: undefined, images: undefined })));
+    }
+
+    setSessionOpen(false);
+    setMessages(prev => [...prev, {
+      role: "ai", text: `Сессия **«${session.name}»** восстановлена: ${excelFiles.length} Excel, ${docFiles.length} документов.`, ts: getTime(),
+    }]);
+   
+  }, []);
 
   // ── Voice input ──
   const toggleVoice = useCallback(() => {
@@ -1414,6 +1543,7 @@ export default function Index() {
         id, name: file.name, type: "docx", role: null,
         text: textResult.value,
         html: result.value,
+        buffer: buf,
       };
       setDocs(prev => [...prev, doc]);
       setActiveDocId(id);
@@ -1588,7 +1718,7 @@ export default function Index() {
     setAiError(null);
 
     try {
-      const result = await callAi(text, files, aiSettings, imgs, docs, prompts);
+      const result = await callAi(text, files, aiSettings, imgs, docs, prompts, messages, knowledge);
 
       let chartData: { name: string; value: number }[] | undefined;
       let chartTitle: string | undefined;
@@ -1944,6 +2074,17 @@ export default function Index() {
               {aiSettings.apiKey ? effectiveModelLabel : "Нет ключа"}
             </span>
           </button>
+          <button onClick={() => setKnowledgeOpen(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all border ${knowledge.some(k => k.enabled) ? "text-amber-400 border-amber-400/40 bg-amber-400/10" : "text-muted-foreground border-border/40 hover:text-foreground hover:bg-secondary"}`}
+            title="База знаний проекта">
+            <Icon name="BookOpen" size={14} />
+            <span className="hidden sm:inline">База знаний</span>
+            {knowledge.filter(k => k.enabled).length > 0 && (
+              <span className="w-4 h-4 rounded-full bg-amber-400 text-[9px] text-black flex items-center justify-center font-bold">
+                {knowledge.filter(k => k.enabled).length}
+              </span>
+            )}
+          </button>
           <button onClick={() => setPromptsOpen(p => !p)}
             className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all border ${prompts.some(p => p.enabled) ? "text-primary border-primary/40 bg-primary/10" : "text-muted-foreground border-border/40 hover:text-foreground hover:bg-secondary"}`}
             title="Управление промптами">
@@ -1954,6 +2095,18 @@ export default function Index() {
                 {prompts.filter(p => p.enabled).length}
               </span>
             )}
+          </button>
+          <button onClick={async () => {
+            const list = await listSessions();
+            setSavedSessions(list);
+            setSessionOpen(true);
+          }}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all border border-border/40"
+            title="Сохранить / открыть проект">
+            {sessionSaving
+              ? <Icon name="Loader2" size={14} className="spinner" />
+              : <Icon name="FolderOpen" size={14} />}
+            <span className="hidden sm:inline">Проект</span>
           </button>
           <button onClick={() => navigate("/oilfield")}
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all border border-border/40"
@@ -2060,21 +2213,64 @@ export default function Index() {
                   </div>
                 )}
 
-                {/* PDF: grid of page images */}
+                {/* PDF: диапазон страниц для ИИ */}
                 {doc.type === "pdf" && !doc.loading && doc.pageImageUrls && doc.pageImageUrls.length > 0 && (
-                  <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-                    {doc.pageImageUrls.map((url, pi) => (
-                      <div key={pi} className="relative rounded-lg overflow-hidden border border-border/40 cursor-pointer hover:border-primary/40 transition-all"
-                        onClick={() => window.open(url, "_blank")}>
-                        <img src={url} alt={`Стр. ${pi + 1}`} className="w-full object-contain bg-white" loading="lazy" />
-                        <div className="absolute bottom-0 left-0 right-0 px-2 py-1 text-[10px] text-white/80 text-center"
-                          style={{ background: "rgba(0,0,0,0.5)" }}>
-                          стр. {pi + 1}
-                        </div>
-                      </div>
-                    ))}
+                  <div className="flex-shrink-0 flex items-center gap-3 px-1 py-2 rounded-xl border border-border/40"
+                    style={{ background: "rgba(255,255,255,0.02)" }}>
+                    <Icon name="SlidersHorizontal" size={14} className="text-muted-foreground flex-shrink-0" />
+                    <span className="text-xs text-muted-foreground whitespace-nowrap">Страницы для ИИ:</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">с</span>
+                      <input type="number" min={1} max={doc.pageImageUrls.length}
+                        value={doc.pageFrom ?? ""}
+                        placeholder="1"
+                        onChange={(e) => setDocs(prev => prev.map(d => d.id === doc.id
+                          ? { ...d, pageFrom: e.target.value ? Math.max(1, parseInt(e.target.value)) : undefined }
+                          : d))}
+                        className="w-16 text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-2 py-1 outline-none focus:border-primary/50 text-center" />
+                      <span className="text-xs text-muted-foreground">по</span>
+                      <input type="number" min={1} max={doc.pageImageUrls.length}
+                        value={doc.pageTo ?? ""}
+                        placeholder={String(doc.pageImageUrls.length)}
+                        onChange={(e) => setDocs(prev => prev.map(d => d.id === doc.id
+                          ? { ...d, pageTo: e.target.value ? Math.min(doc.pageImageUrls!.length, parseInt(e.target.value)) : undefined }
+                          : d))}
+                        className="w-16 text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-2 py-1 outline-none focus:border-primary/50 text-center" />
+                      <span className="text-xs text-muted-foreground">из {doc.pageImageUrls.length}</span>
+                    </div>
+                    {(doc.pageFrom || doc.pageTo) && (
+                      <button onClick={() => setDocs(prev => prev.map(d => d.id === doc.id ? { ...d, pageFrom: undefined, pageTo: undefined } : d))}
+                        className="text-xs text-muted-foreground hover:text-foreground ml-auto flex items-center gap-1">
+                        <Icon name="X" size={11} /> сброс
+                      </button>
+                    )}
                   </div>
                 )}
+
+                {/* PDF: grid of page images */}
+                {doc.type === "pdf" && !doc.loading && doc.pageImageUrls && doc.pageImageUrls.length > 0 && (() => {
+                  const from = Math.max(1, doc.pageFrom ?? 1);
+                  const to = Math.min(doc.pageImageUrls.length, doc.pageTo ?? doc.pageImageUrls.length);
+                  return (
+                    <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                      {doc.pageImageUrls.map((url, pi) => {
+                        const pageNum = pi + 1;
+                        const inRange = pageNum >= from && pageNum <= to;
+                        return (
+                          <div key={pi}
+                            className={`relative rounded-lg overflow-hidden border cursor-pointer transition-all ${inRange ? "border-primary/50 ring-1 ring-primary/20" : "border-border/30 opacity-40"}`}
+                            onClick={() => window.open(url, "_blank")}>
+                            <img src={url} alt={`Стр. ${pageNum}`} className="w-full object-contain bg-white" loading="lazy" />
+                            <div className={`absolute bottom-0 left-0 right-0 px-2 py-1 text-[10px] text-center font-medium ${inRange ? "text-primary" : "text-white/60"}`}
+                              style={{ background: "rgba(0,0,0,0.6)" }}>
+                              стр. {pageNum}{inRange ? " ✓" : ""}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
 
                 {/* DOCX: HTML content */}
                 {doc.type === "docx" && doc.html && (
@@ -2319,6 +2515,19 @@ export default function Index() {
         onChange={(e) => { if (e.target.files) handleFiles(e.target.files); e.target.value = ""; }} />
       <input ref={imageInputRef} type="file" accept="image/*" multiple className="hidden"
         onChange={(e) => { if (e.target.files) Array.from(e.target.files).forEach(loadImage); e.target.value = ""; }} />
+      <input ref={knowledgeTxtRef} type="file" accept=".txt,.md" multiple className="hidden"
+        onChange={async (e) => {
+          if (!e.target.files) return;
+          const newEntries: KnowledgeEntry[] = [];
+          for (const f of Array.from(e.target.files)) {
+            const text = await f.text();
+            newEntries.push({ id: crypto.randomUUID(), title: f.name.replace(/\.[^.]+$/, ""), content: text, enabled: true, updatedAt: Date.now() });
+          }
+          const updated = [...knowledge, ...newEntries];
+          setKnowledge(updated);
+          await saveKnowledge(updated);
+          e.target.value = "";
+        }} />
 
       {/* ── Prompts Modal ── */}
       {promptsOpen && (
@@ -2402,6 +2611,196 @@ export default function Index() {
                 className="px-4 py-1.5 rounded-lg text-xs btn-primary">
                 Готово
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Knowledge Base Modal ── */}
+      {knowledgeOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-12 px-4" style={{ background: "rgba(0,0,0,0.75)" }}
+          onClick={(e) => { if (e.target === e.currentTarget) setKnowledgeOpen(false); }}>
+          <div className="w-full max-w-2xl rounded-2xl border border-amber-400/30 flex flex-col max-h-[85vh]"
+            style={{ background: "hsl(220,14%,8%)" }}>
+
+            <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3">
+              <Icon name="BookOpen" size={16} className="text-amber-400" />
+              <div className="flex-1">
+                <h2 className="font-semibold text-sm text-foreground">База знаний проекта</h2>
+                <p className="text-[11px] text-muted-foreground">Термины, правила интерпретации, словари — ИИ всегда учитывает при ответах</p>
+              </div>
+              <button onClick={() => setKnowledgeOpen(false)} className="text-muted-foreground hover:text-foreground">
+                <Icon name="X" size={16} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-2">
+              {knowledge.length === 0 && (
+                <div className="text-center py-8 text-muted-foreground">
+                  <Icon name="BookOpen" size={32} className="mx-auto mb-3 opacity-30" />
+                  <p className="text-sm">База знаний пуста</p>
+                  <p className="text-xs mt-1">Добавь правила, термины и словари — ИИ будет их всегда учитывать</p>
+                </div>
+              )}
+              {knowledge.map((k) => (
+                <div key={k.id} className={`rounded-xl border transition-all ${k.enabled ? "border-amber-400/30 bg-amber-400/5" : "border-border/40"}`}>
+                  <div className="flex items-start gap-3 p-3">
+                    <button onClick={async () => {
+                      const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, enabled: !kk.enabled } : kk);
+                      setKnowledge(updated);
+                      await saveKnowledge(updated);
+                    }} className={`w-5 h-5 rounded flex items-center justify-center flex-shrink-0 mt-0.5 border-2 transition-all ${k.enabled ? "bg-amber-400 border-amber-400" : "border-border/60 hover:border-amber-400/50"}`}>
+                      {k.enabled && <Icon name="Check" size={11} className="text-black" />}
+                    </button>
+                    <div className="flex-1 min-w-0">
+                      {editingKbId === k.id ? (
+                        <>
+                          <input defaultValue={k.title} onBlur={async (e) => {
+                            const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, title: e.target.value } : kk);
+                            setKnowledge(updated);
+                            await saveKnowledge(updated);
+                          }} className="w-full text-xs font-semibold text-foreground bg-background/50 border border-amber-400/30 rounded px-2 py-0.5 outline-none mb-1" />
+                          <textarea defaultValue={k.content} rows={6}
+                            onBlur={async (e) => {
+                              const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, content: e.target.value, updatedAt: Date.now() } : kk);
+                              setKnowledge(updated);
+                              await saveKnowledge(updated);
+                              setEditingKbId(null);
+                            }}
+                            autoFocus
+                            className="w-full text-xs text-foreground bg-background/50 border border-amber-400/30 rounded-lg px-3 py-2 resize-none outline-none focus:border-amber-400/60 font-mono" />
+                        </>
+                      ) : (
+                        <>
+                          <p className="text-xs font-semibold text-amber-300 mb-1">{k.title}</p>
+                          <p className="text-[11px] text-muted-foreground leading-relaxed line-clamp-3 whitespace-pre-wrap">{k.content}</p>
+                        </>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-1 flex-shrink-0">
+                      <button onClick={() => setEditingKbId(editingKbId === k.id ? null : k.id)}
+                        className="text-muted-foreground hover:text-foreground transition-colors" title="Редактировать">
+                        <Icon name={editingKbId === k.id ? "Check" : "Pencil"} size={13} />
+                      </button>
+                      <button onClick={async () => {
+                        const updated = knowledge.filter(kk => kk.id !== k.id);
+                        setKnowledge(updated);
+                        await saveKnowledge(updated);
+                      }} className="text-muted-foreground hover:text-red-400 transition-colors" title="Удалить">
+                        <Icon name="Trash2" size={13} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              <div className="flex gap-2 pt-1">
+                <button onClick={() => {
+                  const newK: KnowledgeEntry = { id: crypto.randomUUID(), title: "Новое правило", content: "", enabled: true, updatedAt: Date.now() };
+                  const updated = [...knowledge, newK];
+                  setKnowledge(updated);
+                  saveKnowledge(updated);
+                  setEditingKbId(newK.id);
+                }} className="flex-1 py-2.5 rounded-xl border border-dashed border-border/40 text-xs text-muted-foreground hover:text-foreground hover:border-amber-400/30 transition-all flex items-center justify-center gap-2">
+                  <Icon name="Plus" size={13} /> Добавить вручную
+                </button>
+                <button onClick={() => knowledgeTxtRef.current?.click()}
+                  className="flex-1 py-2.5 rounded-xl border border-dashed border-border/40 text-xs text-muted-foreground hover:text-foreground hover:border-amber-400/30 transition-all flex items-center justify-center gap-2">
+                  <Icon name="Upload" size={13} /> Загрузить .txt / .md
+                </button>
+              </div>
+            </div>
+
+            <div className="px-5 py-3 border-t border-border/40 flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">
+                {knowledge.filter(k => k.enabled).length > 0
+                  ? `Активно: ${knowledge.filter(k => k.enabled).map(k => k.title).join(", ")}`
+                  : "Ничего не активно — ИИ не получает дополнительного контекста"}
+              </p>
+              <button onClick={() => setKnowledgeOpen(false)} className="px-4 py-1.5 rounded-lg text-xs btn-primary">Готово</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Session Modal ── */}
+      {sessionOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-12 px-4" style={{ background: "rgba(0,0,0,0.75)" }}
+          onClick={(e) => { if (e.target === e.currentTarget) setSessionOpen(false); }}>
+          <div className="w-full max-w-lg rounded-2xl border border-border/60 flex flex-col max-h-[80vh]"
+            style={{ background: "hsl(220,14%,8%)" }}>
+
+            <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3">
+              <Icon name="FolderOpen" size={16} className="text-primary" />
+              <div className="flex-1">
+                <h2 className="font-semibold text-sm text-foreground">Проект</h2>
+                <p className="text-[11px] text-muted-foreground">Сохранение и восстановление рабочей сессии</p>
+              </div>
+              <button onClick={() => setSessionOpen(false)} className="text-muted-foreground hover:text-foreground">
+                <Icon name="X" size={16} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-3">
+              {/* Сохранить текущее */}
+              <div className="rounded-xl border border-primary/30 p-4 space-y-2" style={{ background: "rgba(52,211,153,0.04)" }}>
+                <p className="text-xs font-semibold text-primary">Сохранить текущую сессию</p>
+                <p className="text-[11px] text-muted-foreground">
+                  Файлы: {files.length} Excel, {docs.length} документов · {messages.length} сообщений
+                </p>
+                <div className="flex gap-2">
+                  <input id="session-name-input" type="text" placeholder="Название сессии..."
+                    defaultValue={`Сессия ${new Date().toLocaleDateString("ru")}`}
+                    className="flex-1 text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-3 py-1.5 outline-none focus:border-primary/50" />
+                  <button onClick={async () => {
+                    const input = document.getElementById("session-name-input") as HTMLInputElement;
+                    const name = input?.value || "Сессия";
+                    const id = `session_${Date.now()}`;
+                    await doSaveSession(id, name);
+                    const list = await listSessions();
+                    setSavedSessions(list);
+                  }} disabled={sessionSaving}
+                    className="px-3 py-1.5 rounded-lg text-xs btn-primary disabled:opacity-50 flex items-center gap-1.5">
+                    {sessionSaving ? <Icon name="Loader2" size={12} className="spinner" /> : <Icon name="Save" size={12} />}
+                    Сохранить
+                  </button>
+                </div>
+              </div>
+
+              {/* Список сессий */}
+              {savedSessions.length === 0 ? (
+                <p className="text-xs text-muted-foreground text-center py-4">Нет сохранённых сессий</p>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground font-medium">Сохранённые сессии:</p>
+                  {savedSessions.map((s) => (
+                    <div key={s.id} className="flex items-center gap-3 px-3 py-2.5 rounded-xl border border-border/40 hover:border-primary/30 transition-all"
+                      style={{ background: "rgba(255,255,255,0.02)" }}>
+                      <Icon name="Clock" size={14} className="text-muted-foreground flex-shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium text-foreground truncate">{s.name}</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          {new Date(s.savedAt).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
+                        </p>
+                      </div>
+                      <button onClick={() => doLoadSession(s.id)}
+                        className="px-2.5 py-1 rounded-lg text-[11px] btn-primary flex-shrink-0">
+                        Открыть
+                      </button>
+                      <button onClick={async () => {
+                        await deleteSession(s.id);
+                        setSavedSessions(prev => prev.filter(ss => ss.id !== s.id));
+                      }} className="text-muted-foreground hover:text-red-400 transition-colors flex-shrink-0">
+                        <Icon name="Trash2" size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="px-5 py-3 border-t border-border/40 text-right">
+              <button onClick={() => setSessionOpen(false)} className="px-4 py-1.5 rounded-lg text-xs btn-primary">Закрыть</button>
             </div>
           </div>
         </div>
