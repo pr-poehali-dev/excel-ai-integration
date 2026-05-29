@@ -878,11 +878,22 @@ type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?:
 type CellStyleMutation = { fileId: string; sheetName: string; changes: CellStyleChange[] };
 
 function extractJson(raw: string): Record<string, unknown> {
-  raw = raw.trim().replace(/^```(?:json)?\s*/m, "").replace(/\s*```$/m, "").trim();
-  try { return JSON.parse(raw); } catch { /* fall through */ }
-  const m = raw.match(/\{[\s\S]*\}/);
+  // 1. Убираем markdown-блоки (```json ... ``` в любом месте)
+  let s = raw.trim();
+  s = s.replace(/```(?:json)?\s*([\s\S]*?)```/g, "$1").trim();
+  // 2. Прямой парс
+  try { return JSON.parse(s); } catch { /* fall through */ }
+  // 3. Ищем ПОСЛЕДНИЙ полный JSON-объект (жадно, от первой { до последней })
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start !== -1 && end > start) {
+    try { return JSON.parse(s.slice(start, end + 1)); } catch { /* fall through */ }
+  }
+  // 4. Пытаемся найти любой JSON-объект регуляркой (на случай вложенных)
+  const m = s.match(/\{[\s\S]*\}/);
   if (m) { try { return JSON.parse(m[0]); } catch { /* fall through */ } }
-  return { text: raw || "ИИ вернул пустой ответ" };
+  // 5. Ничего не нашли — возвращаем текст как есть, но помечаем что это не JSON
+  return { text: raw || "ИИ вернул пустой ответ", _raw_fallback: true };
 }
 
 type CellValueChange = { row: number; col: number; value: CellValue; formula?: string };
@@ -968,7 +979,9 @@ async function callAi(
   const effectiveSystemPrompt = [knowledgeText, activePromptsText, SYSTEM_PROMPT]
     .filter(Boolean).join("\n\n---\n\n");
 
-  const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}\n\nОтветь ТОЛЬКО JSON.`;
+  const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}
+
+⚠️ ОБЯЗАТЕЛЬНО: твой ответ должен быть ТОЛЬКО валидным JSON-объектом. Никакого текста до или после. Никаких \`\`\`json\`\`\` обёрток. Начни ответ с символа { и заверши символом }.`;
 
   // Собираем все изображения: скриншоты + PDF рабочих документов + PDF из базы знаний
   type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
@@ -1007,6 +1020,16 @@ async function callAi(
     ? "openai/gpt-4o"
     : effectiveModel;
 
+  // Модели поддерживающие принудительный JSON-режим (response_format)
+  // Qwen, Llama и ряд других НЕ поддерживают — передавать им не нужно (вернут ошибку 400)
+  const JSON_MODE_MODELS = [
+    "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4",
+    "openai/gpt-4o", "openai/gpt-4o-mini",
+    "deepseek/deepseek-chat", "deepseek/deepseek-r1",
+  ];
+  const supportsJsonMode = JSON_MODE_MODELS.some(m => finalModel.includes(m.split("/").pop()!))
+    && allImageParts.length === 0; // vision + json_object несовместимы
+
   const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
@@ -1022,6 +1045,7 @@ async function callAi(
       ],
       max_tokens: 4000,
       temperature: 0.1,
+      ...(supportsJsonMode ? { response_format: { type: "json_object" } } : {}),
       ...(settings.reasoningEffort !== "none"
         ? { reasoning_effort: settings.reasoningEffort }
         : {}),
@@ -1035,7 +1059,14 @@ async function callAi(
 
   const json = await resp.json() as { choices: { message: { content: string } }[] };
   const raw = json.choices?.[0]?.message?.content ?? "{}";
+  console.log("[AI RAW]", raw.slice(0, 500));
   const result = extractJson(raw);
+
+  // Модель ответила текстом вместо JSON — показываем понятную ошибку
+  if (result._raw_fallback) {
+    const hint = "⚠️ Модель ответила текстом вместо JSON. Попробуй: 1) Переформулировать запрос, 2) Сменить модель на GPT-4o или DeepSeek, 3) Уточнить задание.";
+    return { text: hint };
+  }
 
   // ask_user — ИИ запрашивает уточнение перед выполнением
   if (result.ask_user) {
