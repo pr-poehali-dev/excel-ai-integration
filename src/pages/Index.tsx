@@ -1054,7 +1054,18 @@ async function callAi(
 
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({})) as { error?: { message?: string } };
-    throw new Error(err.error?.message || `Ошибка ${resp.status}`);
+    const errMsg = err.error?.message || "";
+    if (resp.status === 503 || resp.status === 502 || resp.status === 504) {
+      throw new Error(`503 Сервер ИИ временно недоступен — подожди минуту и попробуй снова`);
+    }
+    if (resp.status === 401) throw new Error(`401 Неверный API ключ`);
+    if (resp.status === 429) throw new Error(`429 Превышен лимит запросов — подожди немного`);
+    if (resp.status === 400 && errMsg.includes("response_format")) {
+      // Модель не поддерживает json_object — это нормально, не бросаем ошибку
+      // Это не должно доходить сюда, но на случай если достигло
+      throw new Error(`Модель не поддерживает режим JSON — попробуй GPT-4o или DeepSeek`);
+    }
+    throw new Error(errMsg || `HTTP ${resp.status}`);
   }
 
   const json = await resp.json() as { choices: { message: { content: string } }[] };
@@ -2064,9 +2075,21 @@ export default function Index() {
 
       setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime(), chartData, chartTitle }]);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Неизвестная ошибка";
+      const raw = err instanceof Error ? err.message : "Неизвестная ошибка";
+      let msg = raw;
+      if (raw.includes("Failed to fetch") || raw.includes("NetworkError") || raw.includes("fetch")) {
+        msg = "Не удалось подключиться к серверу ИИ. Возможные причины:\n• Провайдер временно недоступен (503/504) — подожди минуту и попробуй снова\n• Неверный Base URL в настройках\n• Нет интернета";
+      } else if (raw.includes("401") || raw.includes("Unauthorized")) {
+        msg = "Неверный API ключ — проверь настройки (кнопка «Нет ключа» в хедере)";
+      } else if (raw.includes("429") || raw.includes("rate limit")) {
+        msg = "Превышен лимит запросов к модели — подожди немного или смени провайдера";
+      } else if (raw.includes("503") || raw.includes("Service Unavailable")) {
+        msg = "Сервер ИИ временно недоступен (503) — попробуй через минуту или смени провайдера в настройках";
+      } else if (raw.includes("timeout") || raw.includes("timed out")) {
+        msg = "Модель не успела ответить (таймаут) — попробуй более быструю модель или сократи запрос";
+      }
       setAiError(msg);
-      setMessages((prev) => [...prev, { role: "ai", text: `⚠️ Ошибка: ${msg}`, ts: getTime() }]);
+      setMessages((prev) => [...prev, { role: "ai", text: `⚠️ ${msg}`, ts: getTime() }]);
     } finally {
       setAiThinking(false);
       setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 80);
