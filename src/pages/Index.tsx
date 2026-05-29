@@ -150,6 +150,8 @@ interface ChatMessage {
   images?: ChatImage[];
   chartData?: { name: string; value: number }[];
   chartTitle?: string;
+  ask_user?: string;        // вопрос ИИ для уточнения — показываем интерактивную карточку
+  pendingPrompt?: string;   // исходный промпт пользователя, ждёт уточнения
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -442,7 +444,7 @@ function getColHeaderChain(sh: SheetData, c: number, lastHR: number): string[] {
 // Строит полный контекст листа для ИИ.
 // Ключевая идея: каждая ячейка данных сопровождается ПОЛНОЙ смысловой цепочкой заголовков.
 // Пример: P12=1943 [Текущие запасы нефти / извлекаемые / A+B1]
-function buildSheetContext(sh: SheetData): string {
+function buildSheetContext(sh: SheetData, maxDataRows = 500): string {
   const maxCols = getRealColCount(sh);
   const lastHR = detectLastHeaderRow(sh);
   const firstDataRow = lastHR + 1;
@@ -485,7 +487,7 @@ function buildSheetContext(sh: SheetData): string {
   // Формат: A12="K1br пл.АС 5"  P12=1943[Текущие запасы нефти/извлекаемые/A+B1]
   lines.push(`── ДАННЫЕ (строки ${firstDataRow + 1} и далее) ──`);
   let rowsWritten = 0;
-  const MAX_DATA_ROWS = 500;
+  const MAX_DATA_ROWS = maxDataRows;
 
   for (let r = firstDataRow; r < sh.cells.length && rowsWritten < MAX_DATA_ROWS; r++) {
     const row = sh.cells[r];
@@ -524,9 +526,9 @@ function buildSheetContext(sh: SheetData): string {
   return lines.join("\n");
 }
 
-// Короткий TSV-вид для неактивных листов (превью)
-function sheetToText(sh: SheetData, full = false): string {
-  if (full) return buildSheetContext(sh);
+// Контекст листа для ИИ с опциональным лимитом строк
+function sheetToText(sh: SheetData, full = false, maxRows = 500): string {
+  if (full) return buildSheetContext(sh, maxRows);
   const MAX_ROWS = 5;
   const numCols = getRealColCount(sh);
   const dataRows: string[] = [];
@@ -778,93 +780,97 @@ function detectChartType(sheetName: string): ChartType {
 
 // ─── AI call (direct — no backend, no timeout) ───────────────────────────────
 
-const SYSTEM_PROMPT = `Ты — профессиональный аналитик данных и эксперт по Excel.
-Тебе передают содержимое Excel-файлов, задание пользователя, и (опционально) изображения.
+const SYSTEM_PROMPT = `Ты — профессиональный аналитик данных и эксперт по Excel, специализирующийся на нефтяной отрасли.
+Тебе передают: содержимое Excel-файлов и всех их листов, задание пользователя, и (опционально) изображения-образцы.
 
 КРИТИЧЕСКИ ВАЖНО: ты ВСЕГДА отвечаешь ТОЛЬКО валидным JSON. Никакого текста вне JSON. Никаких \`\`\`json\`\`\` обёрток.
 
-Формат ответа (используй ТОЛЬКО нужные поля):
+═══════════════════════════════════════════════
+ПОЛНЫЙ ФОРМАТ ОТВЕТА (используй только нужные поля):
 {
-  "text": "Краткое объяснение действий",
-  "new_sheet": { "file_index": 0, "sheet_name": "Имя", "data": [["Заголовок"],[значение]] },
+  "text": "Объяснение что сделано или что уточнить",
+  "ask_user": "Вопрос к пользователю если данных недостаточно",
+  "new_sheet": { "file_index": 0, "sheet_name": "Название листа", "data": [["Заголовок1","Заголовок2",...],[...]] },
   "cell_updates": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"value":76924,"formula":"=SUM(B5:B10)"}] }],
   "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"bgColor":"FFFFFF00"}] }]
 }
+═══════════════════════════════════════════════
 
-─── КРИТИЧЕСКИ ВАЖНО: КОГДА ЧТО ИСПОЛЬЗОВАТЬ ───
-▸ new_sheet — ТОЛЬКО когда нужно создать НОВЫЙ лист или полностью заменить существующий.
-  ЗАПРЕЩЕНО использовать new_sheet если задание звучит как:
-  "пропиши формулы", "добавь суммы", "заполни строку", "пересчитай", "вставь значения", "обнови ячейки".
-  new_sheet УНИЧТОЖАЕТ все данные листа — используй только для создания с нуля.
+━━━ РЕЖИМ 1: СОЗДАНИЕ НОВОЙ ТАБЛИЦЫ / ГРАФИКА (new_sheet) ━━━
 
-▸ cell_updates — для точечного изменения/добавления значений в СУЩЕСТВУЮЩИЙ лист.
-  Используй когда нужно: добавить формулы, вставить суммы, пересчитать ячейки, заполнить строку.
-  Данные листа при этом НЕ затрагиваются — меняются только указанные ячейки.
-  Поля объекта change: row (0-based), col (0-based), value (число/строка — результат), formula (опционально, строка вида "=SUM(B5:B10)").
-  Если передаёшь formula — также передай value = вычисленный результат формулы.
+Используй new_sheet когда задание: "создай таблицу", "сделай сводную", "построй график", "подготовь лист по образцу", "сформируй отчёт", "обнови данные в таблице", "заполни по шаблону".
 
-▸ cell_styles — для изменения цвета/жирности ячеек. Не меняет значения.
+АЛГОРИТМ:
+1. Определи источник данных — какой лист/файл содержит нужные данные (по названию листа в задании).
+2. Найди нужные строки и столбцы в данных источника, используя заголовки столбцов как смысловые метки.
+3. Если передан образец (изображение) — воспроизведи его структуру: заголовки, строки, порядок столбцов.
+4. Если образца нет — построй логичную таблицу с понятными заголовками.
+5. Верни new_sheet с полными данными: первая строка — заголовки, остальные — данные.
+6. Числа передавай как числа (не строки). Пустые ячейки — null.
+7. Название листа (sheet_name) — короткое и понятное, на русском.
 
-─── КООРДИНАТЫ В cell_styles ───
-  row = номер_строки_Excel - 1  (строка 12 → row:11, строка 15 → row:14)
-  col = позиция столбца 0-based: A=0 B=1 C=2 D=3 E=4 F=5 G=6 H=7 I=8 J=9 K=10 L=11 M=12 N=13 O=14 P=15 Q=16 R=17 S=18 T=19 U=20 V=21 W=22
-bgColor — AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000
+ПРАВИЛА new_sheet:
+- new_sheet заменяет/создаёт лист целиком — не используй для точечных правок.
+- file_index — индекс файла из контекста (0 = первый файл, 1 = второй, ...).
+- Максимум 500 строк данных.
+- Если нужно несколько таблиц — верни несколько new_sheet в массиве (поле "new_sheets": [...]).
 
-─── КАК ЧИТАТЬ ДАННЫЕ ЛИСТА ───
-Контекст передаётся в 3 секциях:
+━━━ РЕЖИМ 2: ТОЧЕЧНОЕ ОБНОВЛЕНИЕ ЯЧЕЕК (cell_updates) ━━━
 
-1. ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ — все объединения с адресами Excel.
-   Читай внимательно: каждый диапазон — это заголовок, покрывающий определённые столбцы и строки.
+Используй cell_updates когда: "пропиши формулы", "вставь суммы", "обнови ячейку", "добавь строку итогов".
+- row и col — 0-based (строка Excel 1 = row 0, столбец A = col 0)
+- Если есть formula — также укажи value = вычисленный результат.
 
-2. ЗАГОЛОВКИ СТОЛБЦОВ — смысловая цепочка для каждого столбца (читается сверху вниз).
-   Пример:
-     K = "На государственном балансе / извлекаемые / B2"
-     L = "На государственном балансе / КИН доли ед. / A+B1"
-     M = "На государственном балансе / КИН доли ед. / B2"
-   Каждый столбец имеет УНИКАЛЬНУЮ цепочку. Буква столбца в цепочке НЕ связана с названием показателя.
+━━━ РЕЖИМ 3: СТИЛИ (cell_styles) ━━━
 
-3. ДАННЫЕ — каждая ячейка: адрес + значение + тег [смысловая цепочка столбца].
-   Пример: L15=0.281[На государственном балансе/КИН доли ед./A+B1]
-   [РАЗДЕЛ] строки — разделители групп, не трогай их если задание про данные.
+Используй для покраски/жирности ячеек.
+bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, синий=FF4472C4
 
-─── ОБЯЗАТЕЛЬНЫЙ АЛГОРИТМ (выполняй СТРОГО по шагам) ───
+━━━ ЗАПРОС УТОЧНЕНИЙ (ask_user) ━━━
 
-ШАГ 1. Определи ТОЧНЫЙ смысл нужного показателя из задания пользователя.
-  Например: "КИН категории A+B1 текущих запасов" → ищу столбец с цепочкой содержащей "КИН" И "A+B1" И "текущ".
+Используй ask_user когда данных НЕДОСТАТОЧНО для выполнения задания:
+- Не найден нужный лист или файл
+- Непонятно какие строки/объекты включить в таблицу
+- Нет образца а структура таблицы неоднозначна
+- Нужно уточнить единицы измерения, год, категорию запасов
 
-ШАГ 2. Просмотри ЗАГОЛОВКИ СТОЛБЦОВ — найди столбец(цы) где цепочка ТОЧНО совпадает со смыслом из шага 1.
-  НЕ УГАДЫВАЙ по букве столбца. НЕ используй позицию (K, L, M...) как подсказку для смысла.
-  Если нужных столбцов несколько — включи все.
+Формат: {"text": "Не хватает данных", "ask_user": "Уточни: какой год данных использовать — 2023 или 2024?"}
+После получения ответа — выполни задание.
+НЕ спрашивай о том что уже очевидно из контекста. Задавай ОДИН конкретный вопрос.
 
-ШАГ 3. Найди нужную строку(и) в ДАННЫХ — по тексту в столбце A (название пласта/скважины/показателя).
-  Ищи ТОЧНОЕ или наиболее близкое совпадение.
-  [РАЗДЕЛ] строки пропускай — они не данные.
+━━━ КАК ЧИТАТЬ КОНТЕКСТ ЛИСТОВ ━━━
 
-ШАГ 4. Для каждой найденной ячейки (столбец из шага 2, строка из шага 3):
-  col = числовая позиция буквы (смотри таблицу выше, A=0 B=1 ... K=10 L=11 M=12 ...)
-  row = номер строки Excel МИНУС 1
-  
-ШАГ 5. В поле "text" ОБЪЯСНИ свою логику: какой столбец нашёл и почему, какую строку, что выделяешь.
+Данные каждого листа передаются в секциях:
 
-─── КРИТИЧЕСКИЕ ПРАВИЛА ───
-- Буква столбца (K, L, M...) НЕ означает смысл. Только цепочка [...] определяет смысл ячейки.
-- Никогда не путай соседние столбцы: K=10, L=11, M=12 — это разные col.
-- Если нашёл столбец с буквой L, то col=11 (НЕ 10, НЕ 12).
-- Если задание говорит "КИН A+B1" — ищи столбец где В ЦЕПОЧКЕ есть "КИН" И "A+B1".
-- Если задание говорит "все текущие запасы" — включай ВСЕ столбцы секции "текущие запасы".
-- Не выделяй ячейки из [РАЗДЕЛ] строк.
+1. ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ — диапазоны заголовков.
+2. ЗАГОЛОВКИ СТОЛБЦОВ — смысловая цепочка для каждого столбца (читай сверху вниз).
+   Пример: K = "Балансовые запасы / извлекаемые / B2"
+   Буква столбца (K, L...) НЕ означает смысл — только цепочка.
+3. ДАННЫЕ — ячейки: адрес + значение + [цепочка столбца].
+   Пример: L15=0.281[КИН/A+B1]
+   [РАЗДЕЛ] строки — разделители, не данные.
 
-─── ПРИМЕР ───
-Задание: "выдели КИН текущих запасов A+B1 по пласту K1br пл.АС 7 (Залежь 1)"
+Листы в контексте помечены:
+- [АКТИВНЫЙ ЛИСТ] — тот что открыт у пользователя, обычно целевой для записи результата
+- [лист: "Название"] — остальные листы того же файла = источники данных
+- Файлы с ролью [ОБРАЗЕЦ] — берёшь из них структуру/формат
 
-Шаг 1: нужен показатель "КИН / текущие запасы / A+B1"
-Шаг 2: смотрю ЗАГОЛОВКИ СТОЛБЦОВ:
-  L = "Текущие запасы / КИН доли ед. / A+B1"  ← ТОЧНОЕ совпадение! col=11
-Шаг 3: смотрю ДАННЫЕ, ищу строку с "K1br пл.АС 7 (Залежь 1)":
-  строка 15: A15="K1br пл.АС 7 (Залежь 1)"  L15=0.281[...] → строка 15, row=14
-Шаг 4: col=11, row=14
-Ответ: {"row":14,"col":11,"bgColor":"FFFFFF00"}
-В "text": "Нашёл столбец L (col=11) — 'Текущие запасы/КИН/A+B1'. Строка 15 — пласт K1br пл.АС 7. Выделил L15."`;
+АЛГОРИТМ поиска данных:
+ШАГ 1. Найди нужный лист по имени из задания (например "лист ГТС" → ищи лист с таким именем).
+ШАГ 2. В этом листе найди нужные столбцы по ЦЕПОЧКЕ заголовков (не по букве).
+ШАГ 3. Найди нужные строки по значению в столбце A (названия объектов, пластов, скважин).
+ШАГ 4. Собери данные в таблицу и верни new_sheet.
+ШАГ 5. В поле "text" — кратко: откуда взял данные, что сделал.
+
+━━━ КРИТИЧЕСКИЕ ПРАВИЛА ━━━
+- Буква столбца (K, L, M...) НЕ определяет смысл. Только цепочка в [...] тегах.
+- K=col10, L=col11, M=col12 — не перепутай.
+- Если нашёл столбец с буквой L → col=11.
+- Числа в data — числами, не строками.
+- Если данных нет в переданном контексте — спроси через ask_user, не выдумывай.`;
+
+// Вспомогательный компонент: карточка с вопросом ИИ
+// (используется ниже в JSX)
 
 
 
@@ -893,6 +899,7 @@ async function callAi(
   knowledgeEntries: KnowledgeEntry[]
 ): Promise<{
   text: string;
+  ask_user?: string;
   mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[];
   styleMutations?: CellStyleMutation[];
   valueMutations?: CellValueMutation[];
@@ -905,20 +912,26 @@ async function callAi(
     : selectedModel;
   const baseUrl = settings.baseUrl.replace(/\/$/, "");
 
-  // Строим контекст файлов
+  // Строим контекст файлов — все листы передаются полностью (активный + источники данных)
   const contextParts: string[] = [];
+  // Общий бюджет токенов на все листы. Активный лист получает больше, остальные делят остаток.
+  const ACTIVE_MAX_ROWS = 300;
+  const OTHER_MAX_ROWS = 150; // достаточно для поиска нужных данных
   files.forEach((f, fi) => {
     const roleLabel = f.role === "main" ? " [ОСНОВНОЙ]" : f.role === "reference" ? " [ОБРАЗЕЦ]" : "";
     contextParts.push(`=== Excel-файл ${fi} «${f.name}»${roleLabel} ===`);
+    contextParts.push(`Листы: ${f.sheets.map((s, si) => `«${s.name}»${si === f.activeSheet ? " (активный)" : ""}`).join(", ")}`);
     f.sheets.forEach((sh, si) => {
       const isActive = si === f.activeSheet;
       const totalRows = sh.cells.filter(r => r.some(c => c.v !== null)).length;
       const realCols = getRealColCount(sh);
+      const maxRows = isActive ? ACTIVE_MAX_ROWS : OTHER_MAX_ROWS;
+      const truncated = totalRows > maxRows;
       const marker = isActive
-        ? ` [АКТИВНЫЙ — полные данные, строк: ${totalRows}, столбцов: ${realCols}]`
-        : ` [краткий просмотр, всего ${totalRows} строк]`;
+        ? ` [АКТИВНЫЙ ЛИСТ — сюда записывать результат, строк: ${totalRows}, столбцов: ${realCols}]`
+        : ` [лист-источник данных, строк: ${totalRows}${truncated ? `, показано ${maxRows}` : ""}]`;
       contextParts.push(`--- Лист «${sh.name}»${marker} ---`);
-      contextParts.push(sheetToText(sh, isActive));
+      contextParts.push(sheetToText(sh, true, maxRows)); // всегда полный контекст с заголовками
     });
   });
 
@@ -1024,11 +1037,30 @@ async function callAi(
   const raw = json.choices?.[0]?.message?.content ?? "{}";
   const result = extractJson(raw);
 
+  // ask_user — ИИ запрашивает уточнение перед выполнением
+  if (result.ask_user) {
+    return {
+      text: (result.text as string) || "Нужно уточнение",
+      ask_user: result.ask_user as string,
+    };
+  }
+
   const mutations: { fileId: string; sheetName: string; data: CellValue[][] }[] = [];
+
+  // Один лист (new_sheet)
   if (result.new_sheet) {
     const ns = result.new_sheet as { file_index?: number; sheet_name: string; data: CellValue[][] };
     const targetFile = files[ns.file_index ?? 0] ?? files[0];
     if (targetFile) mutations.push({ fileId: targetFile.id, sheetName: ns.sheet_name, data: ns.data });
+  }
+  // Несколько листов (new_sheets — массив)
+  if (Array.isArray(result.new_sheets)) {
+    for (const ns of result.new_sheets as { file_index?: number; sheet_name: string; data: CellValue[][] }[]) {
+      const targetFile = files[ns.file_index ?? 0] ?? files[0];
+      if (targetFile && ns.sheet_name && Array.isArray(ns.data)) {
+        mutations.push({ fileId: targetFile.id, sheetName: ns.sheet_name, data: ns.data });
+      }
+    }
   }
 
   const styleMutations: CellStyleMutation[] = [];
@@ -1086,6 +1118,9 @@ async function callAi(
     valueMutations: valueMutations.length ? valueMutations : undefined,
   };
 }
+
+// ─── AI Question Card ──────────────────────────────────────────────────────────
+// Карточка с вопросом ИИ — вставляется в чат, пользователь отвечает прямо в ней
 
 // ─── Cell Editor ──────────────────────────────────────────────────────────────
 
@@ -1736,6 +1771,18 @@ export default function Index() {
 
     try {
       const result = await callAi(text, files, aiSettings, imgs, docs, prompts, messages, knowledge);
+
+      // ИИ запрашивает уточнение — показываем карточку с вопросом
+      if (result.ask_user) {
+        setMessages((prev) => [...prev, {
+          role: "ai",
+          text: result.text,
+          ts: getTime(),
+          ask_user: result.ask_user,
+          pendingPrompt: text,
+        }]);
+        return;
+      }
 
       let chartData: { name: string; value: number }[] | undefined;
       let chartTitle: string | undefined;
@@ -2409,6 +2456,56 @@ export default function Index() {
                       </div>
                     )}
                     <p dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }} />
+
+                    {/* ── ask_user: карточка с вопросом ИИ ── */}
+                    {msg.ask_user && msg.role === "ai" && (() => {
+                      const isAnswered = messages.slice(i + 1).some(m => m.role === "user");
+                      return !isAnswered ? (
+                        <div className="mt-2.5 rounded-xl border border-primary/30 overflow-hidden"
+                          style={{ background: "rgba(52,211,153,0.05)" }}>
+                          <div className="flex items-start gap-2 px-3 py-2.5">
+                            <Icon name="HelpCircle" size={14} className="text-primary flex-shrink-0 mt-0.5" />
+                            <p className="text-[11px] text-foreground leading-relaxed flex-1">{msg.ask_user}</p>
+                          </div>
+                          <div className="flex gap-1.5 px-3 pb-2.5">
+                            <input
+                              autoFocus
+                              placeholder="Ответ..."
+                              className="flex-1 text-xs bg-background/60 border border-border/60 text-foreground rounded-lg px-3 py-1.5 outline-none focus:border-primary/50 placeholder:text-muted-foreground"
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && e.currentTarget.value.trim()) {
+                                  const answer = e.currentTarget.value.trim();
+                                  // Объединяем исходный промпт + ответ на вопрос
+                                  const combined = `${msg.pendingPrompt || ""}\n\nУточнение: ${answer}`;
+                                  setAiInput(combined);
+                                  // Убираем карточку вопроса, помечая сообщение как отвеченное
+                                  setMessages(prev => prev.map((m, mi) =>
+                                    mi === i ? { ...m, ask_user: undefined } : m
+                                  ));
+                                  setTimeout(() => handleAiSend(), 50);
+                                }
+                              }}
+                            />
+                            <button
+                              className="px-3 py-1.5 rounded-lg text-xs btn-primary flex-shrink-0"
+                              onClick={(e) => {
+                                const input = e.currentTarget.previousElementSibling as HTMLInputElement;
+                                const answer = input?.value?.trim();
+                                if (!answer) return;
+                                const combined = `${msg.pendingPrompt || ""}\n\nУточнение: ${answer}`;
+                                setAiInput(combined);
+                                setMessages(prev => prev.map((m, mi) =>
+                                  mi === i ? { ...m, ask_user: undefined } : m
+                                ));
+                                setTimeout(() => handleAiSend(), 50);
+                              }}>
+                              Отправить
+                            </button>
+                          </div>
+                        </div>
+                      ) : null;
+                    })()}
+
                     {/* Inline chart in AI message */}
                     {msg.chartData && msg.chartData.length > 0 && (
                       <div className="mt-3 -mx-1">
