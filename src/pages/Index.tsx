@@ -1119,6 +1119,60 @@ async function callAi(
   };
 }
 
+// ─── CopySheetButton ──────────────────────────────────────────────────────────
+// Копирует активный лист как TSV — вставляется прямо в Excel, Google Sheets, Word
+
+function CopySheetButton({ sheet }: { sheet: SheetData }) {
+  const [state, setState] = useState<"idle" | "ok" | "err">("idle");
+
+  const handleCopy = async () => {
+    try {
+      const numCols = getRealColCount(sheet);
+      const rows: string[] = [];
+      sheet.cells.forEach(row => {
+        // Пропускаем полностью пустые строки
+        if (!row.some(c => c.v !== null)) return;
+        const cells = Array.from({ length: numCols }, (_, ci) => {
+          const v = row[ci]?.v;
+          if (v === null || v === undefined) return "";
+          const s = typeof v === "number" ? String(v) : String(v);
+          // Если значение содержит таб/перенос — оборачиваем в кавычки
+          return s.includes("\t") || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s;
+        });
+        rows.push(cells.join("\t"));
+      });
+      const tsv = rows.join("\n");
+      await navigator.clipboard.writeText(tsv);
+      setState("ok");
+      setTimeout(() => setState("idle"), 2000);
+    } catch {
+      setState("err");
+      setTimeout(() => setState("idle"), 2000);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      title="Скопировать лист — вставляется в Excel, Google Sheets, Word"
+      className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] border transition-all ${
+        state === "ok"
+          ? "text-primary border-primary/40 bg-primary/10"
+          : state === "err"
+          ? "text-red-400 border-red-400/30 bg-red-400/10"
+          : "text-muted-foreground border-transparent hover:text-foreground hover:bg-secondary hover:border-border/40"
+      }`}>
+      <Icon
+        name={state === "ok" ? "CheckCheck" : state === "err" ? "X" : "Copy"}
+        size={12}
+      />
+      <span className="hidden md:inline">
+        {state === "ok" ? "Скопировано!" : state === "err" ? "Ошибка" : "Скопировать"}
+      </span>
+    </button>
+  );
+}
+
 // ─── AI Question Card ──────────────────────────────────────────────────────────
 // Карточка с вопросом ИИ — вставляется в чат, пользователь отвечает прямо в ней
 
@@ -2193,7 +2247,7 @@ export default function Index() {
 
           {activeFile && activeSheet && (
             <>
-              {/* Formula bar */}
+              {/* Formula bar + кнопки копирования */}
               <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border/40 flex-shrink-0"
                 style={{ background: "rgba(255,255,255,0.01)" }}>
                 <span className="text-xs font-mono text-muted-foreground w-12 text-center flex-shrink-0">
@@ -2203,6 +2257,29 @@ export default function Index() {
                 <span className="text-xs font-mono text-foreground flex-1 truncate">
                   {selected ? String(activeSheet.cells[selected.row]?.[selected.col]?.v ?? "") : ""}
                 </span>
+
+                {/* ── Кнопки копирования / экспорта листа ── */}
+                <div className="flex items-center gap-1 flex-shrink-0 ml-2">
+                  {/* Копировать лист как TSV (вставляется в Excel/Sheets) */}
+                  <CopySheetButton sheet={activeSheet} />
+                  {/* Скачать только этот лист как xlsx */}
+                  <button
+                    title="Скачать этот лист как отдельный Excel-файл"
+                    onClick={() => {
+                      const wb = XLSX.utils.book_new();
+                      const numCols = getRealColCount(activeSheet);
+                      const data = activeSheet.cells
+                        .filter(row => row.some(c => c.v !== null))
+                        .map(row => Array.from({ length: numCols }, (_, ci) => row[ci]?.v ?? null));
+                      const ws = XLSX.utils.aoa_to_sheet(data);
+                      XLSX.utils.book_append_sheet(wb, ws, activeSheet.name);
+                      XLSX.writeFile(wb, `${activeSheet.name}.xlsx`, { bookType: "xlsx" });
+                    }}
+                    className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] text-muted-foreground hover:text-foreground hover:bg-secondary border border-transparent hover:border-border/40 transition-all">
+                    <Icon name="Download" size={12} />
+                    <span className="hidden md:inline">Скачать лист</span>
+                  </button>
+                </div>
               </div>
 
               {/* Sheet tabs */}
