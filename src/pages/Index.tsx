@@ -1195,8 +1195,10 @@ async function callAi(
 
   const json = await resp.json() as { choices: { message: { content: string } }[] };
   const raw = json.choices?.[0]?.message?.content ?? "{}";
-  console.log("[AI RAW]", raw.slice(0, 500));
+  console.log("[AI RAW]", raw.slice(0, 2000));
   const result = extractJson(raw);
+  if (result.cell_styles) console.log("[AI CELL_STYLES]", JSON.stringify(result.cell_styles));
+  if (result.cell_updates) console.log("[AI CELL_UPDATES]", JSON.stringify(result.cell_updates));
 
   // Модель ответила текстом вместо JSON — показываем понятную ошибку
   if (result._raw_fallback) {
