@@ -850,8 +850,8 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
   "text": "Объяснение что сделано или что уточнить",
   "ask_user": "Вопрос к пользователю если данных недостаточно",
   "new_sheet": { "file_index": 0, "sheet_name": "Название листа", "data": [["Заголовок1","Заголовок2",...],[...]] },
-  "cell_updates": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"value":76924,"formula":"=SUM(B5:B10)"}] }],
-  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"bgColor":"FFFFFF00"}] }],
+  "cell_updates": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":0,"col":1,"row_text":"Добыча нефти всего","value":76924}] }],
+  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":0,"col":9,"row_text":"Действующий фонд добывающих скважин на конец года","bgColor":"FFFFFF00"}] }],
   "doc_update": { "doc_name": "Описание проект факт", "text": "Полный обновлённый текст документа целиком" }
 }
 ═══════════════════════════════════════════════
@@ -950,9 +950,9 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 
 ━━━ КРИТИЧЕСКИЕ ПРАВИЛА ━━━
 - ВСЕГДА используй "ЦЕПОЧКИ ЗАГОЛОВКОВ" чтобы найти нужный столбец. Никогда не угадывай букву.
-- row: в данных каждая строка помечена явно: "28(row=27)" — используй ТОЛЬКО число в скобках (row=27), не 28.
-- col: используй число после "col=" в цепочке. J(col=9) → col=9. L(col=11) → col=11.
-- ПРИМЕР: строка "28(row=27): J28=316[2023/Проект]" → row=27, col=9.
+- col: используй число после "col=" в цепочке. J(col=9) → col=9. N(col=13) → col=13.
+- row_text ОБЯЗАТЕЛЕН: всегда указывай текст из столбца A нужной строки. Пример: "Действующий фонд добывающих скважин на конец года". Код сам найдёт правильный row по этому тексту — даже если ты ошибёшься с номером.
+- row: укажи приблизительный номер (можно 0 если не знаешь) — row_text важнее.
 - Числа в data — числами, не строками.
 - Если данных нет в переданном контексте — спроси через ask_user, не выдумывай.`;
 
@@ -961,7 +961,7 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 
 
 
-type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?: string; bold?: boolean };
+type CellStyleChange = { row: number; col: number; row_text?: string; bgColor?: string; fontColor?: string; bold?: boolean };
 type CellStyleMutation = { fileId: string; sheetName: string; changes: CellStyleChange[] };
 
 function DocTextBlock({ text, name }: { text: string; name?: string }) {
@@ -1005,7 +1005,7 @@ function extractJson(raw: string): Record<string, unknown> {
   return { text: raw || "ИИ вернул пустой ответ", _raw_fallback: true };
 }
 
-type CellValueChange = { row: number; col: number; value: CellValue; formula?: string };
+type CellValueChange = { row: number; col: number; row_text?: string; value: CellValue; formula?: string };
 type CellValueMutation = { fileId: string; sheetName: string; changes: CellValueChange[] };
 
 async function callAi(
@@ -2066,6 +2066,26 @@ export default function Index() {
         setActiveFileId(firstMut.fileId);
       }
 
+      // Поиск строки по тексту в столбце A (для row_text)
+      // Если ИИ ошибся с row — код сам найдёт правильный индекс по тексту
+      const resolveRow = (sh: { cells: CellData[][] }, rowHint: number, rowText?: string): number => {
+        if (!rowText) return rowHint;
+        const needle = rowText.toLowerCase().trim();
+        for (let r = 0; r < sh.cells.length; r++) {
+          const cell = sh.cells[r]?.[0];
+          const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).toLowerCase().trim();
+          if (val && (val.includes(needle) || needle.includes(val))) return r;
+        }
+        // Попробуем частичное совпадение по первым словам (≥3 символов)
+        const words = needle.split(/\s+/).filter(w => w.length >= 3);
+        for (let r = 0; r < sh.cells.length; r++) {
+          const cell = sh.cells[r]?.[0];
+          const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).toLowerCase().trim();
+          if (val && words.length > 0 && words.every(w => val.includes(w))) return r;
+        }
+        return rowHint; // fallback на то что дал ИИ
+      };
+
       // Применяем стили к ячейкам — пишем в cells[] и в оригинальный workbook
       if (result.styleMutations && result.styleMutations.length > 0) {
         setFiles((prev) => prev.map((f) => {
@@ -2077,17 +2097,18 @@ export default function Index() {
           sm.forEach(({ sheetName, changes }) => {
             const ws = wb.Sheets[sheetName];
             if (!ws) return;
-            changes.forEach(({ row, col, bgColor, fontColor, bold }) => {
-              const addr = XLSX.utils.encode_cell({ r: row, c: col });
+            const sh = f.sheets.find(s => s.name === sheetName);
+            changes.forEach(({ row, col, row_text, bgColor, fontColor, bold }) => {
+              const resolvedRow = sh ? resolveRow(sh, row, row_text) : row;
+              console.log(`[STYLE] row_text="${row_text}" hint=${row} resolved=${resolvedRow} col=${col}`);
+              const addr = XLSX.utils.encode_cell({ r: resolvedRow, c: col });
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               let cell = ws[addr] as any;
               if (!cell) {
-                // Создаём пустую ячейку если её нет — чтобы покрасить даже пустые
                 cell = { t: "z", v: null };
                 ws[addr] = cell;
-                // Расширяем !ref если нужно
                 const ref = XLSX.utils.decode_range(ws["!ref"] || "A1");
-                if (row > ref.e.r) ref.e.r = row;
+                if (resolvedRow > ref.e.r) ref.e.r = resolvedRow;
                 if (col > ref.e.c) ref.e.c = col;
                 ws["!ref"] = XLSX.utils.encode_range(ref);
               }
@@ -2113,16 +2134,16 @@ export default function Index() {
             const sm2 = sm.find(s => s.sheetName === sh.name);
             if (!sm2) return sh;
             const cells = sh.cells.map(row => [...row]);
-            sm2.changes.forEach(({ row, col, bgColor, fontColor, bold }) => {
-              // Расширяем массив если ИИ указал строку за пределами
-              if (row >= cells.length) {
+            sm2.changes.forEach(({ row, col, row_text, bgColor, fontColor, bold }) => {
+              const resolvedRow = resolveRow(sh, row, row_text);
+              if (resolvedRow >= cells.length) {
                 const colCount = cells[0]?.length ?? 30;
-                while (cells.length <= row) cells.push(Array.from({ length: colCount }, () => ({ v: null })));
+                while (cells.length <= resolvedRow) cells.push(Array.from({ length: colCount }, () => ({ v: null })));
               }
-              if (col >= cells[row].length) {
-                while (cells[row].length <= col) cells[row].push({ v: null });
+              if (col >= cells[resolvedRow].length) {
+                while (cells[resolvedRow].length <= col) cells[resolvedRow].push({ v: null });
               }
-              const prev = cells[row][col] ?? { v: null };
+              const prev = cells[resolvedRow][col] ?? { v: null };
               const newStyle: CellStyle = { ...(prev.s ?? {}) };
               if (bgColor) {
                 // Поддерживаем форматы: AARRGGBB (8 символов) и RRGGBB (6 символов)
@@ -2134,7 +2155,7 @@ export default function Index() {
                 newStyle.color = `#${hex}`;
               }
               if (bold !== undefined) newStyle.bold = bold;
-              cells[row][col] = { ...prev, s: newStyle };
+              cells[resolvedRow][col] = { ...prev, s: newStyle };
             });
             return { ...sh, cells };
           });
@@ -2162,21 +2183,22 @@ export default function Index() {
           vm.forEach(({ sheetName, changes }) => {
             const ws = wb.Sheets[sheetName];
             if (!ws) return;
-            changes.forEach(({ row, col, value, formula }) => {
-              const addr = XLSX.utils.encode_cell({ r: row, c: col });
-              const displayVal = formula ? value : value;
+            const sh = f.sheets.find(s => s.name === sheetName);
+            changes.forEach(({ row, col, row_text, value, formula }) => {
+              const resolvedRow = sh ? resolveRow(sh, row, row_text) : row;
+              const addr = XLSX.utils.encode_cell({ r: resolvedRow, c: col });
               const cellType = typeof value === "number" ? "n" : "s";
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const existing = ws[addr] as any;
               ws[addr] = {
                 ...(existing ?? {}),
                 t: value == null ? "z" : cellType,
-                v: displayVal,
+                v: value,
                 w: value != null ? String(value) : undefined,
                 ...(formula ? { f: formula.replace(/^=/, "") } : {}),
               };
               const ref = XLSX.utils.decode_range(ws["!ref"] || "A1");
-              if (row > ref.e.r) ref.e.r = row;
+              if (resolvedRow > ref.e.r) ref.e.r = resolvedRow;
               if (col > ref.e.c) ref.e.c = col;
               ws["!ref"] = XLSX.utils.encode_range(ref);
             });
@@ -2186,16 +2208,17 @@ export default function Index() {
             const vm2 = vm.find(m => m.sheetName === sh.name);
             if (!vm2) return sh;
             const cells = sh.cells.map(row => [...row]);
-            vm2.changes.forEach(({ row, col, value, formula }) => {
-              if (row >= cells.length) {
+            vm2.changes.forEach(({ row, col, row_text, value, formula }) => {
+              const resolvedRow = resolveRow(sh, row, row_text);
+              if (resolvedRow >= cells.length) {
                 const colCount = cells[0]?.length ?? 30;
-                while (cells.length <= row) cells.push(Array.from({ length: colCount }, () => ({ v: null })));
+                while (cells.length <= resolvedRow) cells.push(Array.from({ length: colCount }, () => ({ v: null })));
               }
-              if (col >= cells[row].length) {
-                while (cells[row].length <= col) cells[row].push({ v: null });
+              if (col >= cells[resolvedRow].length) {
+                while (cells[resolvedRow].length <= col) cells[resolvedRow].push({ v: null });
               }
-              const prev = cells[row][col] ?? { v: null };
-              cells[row][col] = {
+              const prev = cells[resolvedRow][col] ?? { v: null };
+              cells[resolvedRow][col] = {
                 ...prev,
                 v: value,
                 w: formula ? formula : (value != null ? String(value) : undefined),
