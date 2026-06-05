@@ -434,10 +434,12 @@ function getColHeaderChain(sh: SheetData, c: number, lastHR: number): string[] {
     const owner = getMergeOwner(sh, r, c);
     const cell = owner ? sh.cells[owner.r]?.[owner.c] : sh.cells[r]?.[c];
     const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).trim();
-    // Пропускаем числа, пустые строки и строки-нумерации (чисто цифровые значения)
     if (!val) continue;
-    if (typeof cell?.v === "number") continue;
-    if (/^\d+$/.test(val)) continue; // строки вида "1", "2", "13" — номера столбцов
+    // Годы (2020-2040) включаем — это важная часть заголовка столбца
+    const isYear = typeof cell?.v === "number" && cell.v >= 2020 && cell.v <= 2040;
+    // Номера столбцов (1, 2, 3...) и прочие числа — пропускаем
+    if (!isYear && typeof cell?.v === "number") continue;
+    if (!isYear && /^\d+$/.test(val)) continue;
     if (!seen.has(val)) { seen.add(val); parts.push(val); }
   }
   return parts;
