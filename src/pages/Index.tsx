@@ -489,7 +489,8 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
       if (chain.length > 0) lines.push(`  ${colLetter(c)}(col=${c}) = "${chain.join(" / ")}"`);
     }
 
-    lines.push("ДАННЫЕ (строки ниже, первая колонка = A):");
+    lines.push(`ДАННЫЕ (формат: "Excel_строка(row=индекс_0based)\\tA\\tB\\tC...")`);
+    lines.push(`ВАЖНО: для cell_styles/cell_updates используй row=индекс из скобок, col=из ЦЕПОЧЕК ЗАГОЛОВКОВ`);
     let written = 0;
     for (let r = lastHR + 1; r < sh.cells.length && written < maxDataRows; r++) {
       const row = sh.cells[r];
@@ -498,7 +499,7 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
         const v = row[c]?.v;
         return v !== null && v !== undefined ? String(v) : "";
       });
-      lines.push(`${r + 1}\t` + cells.join("\t"));
+      lines.push(`${r + 1}(row=${r})\t` + cells.join("\t"));
       written++;
     }
     if (written >= maxDataRows) lines.push(`[... ещё ${totalDataRows - written} строк не передано]`);
@@ -575,7 +576,7 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
 
     if (cells.length > 0) {
       const prefix = isGroupHeader ? "  [РАЗДЕЛ] " : "  ";
-      lines.push(`${prefix}строка ${r + 1}: ${cells.join("  ")}`);
+      lines.push(`${prefix}строка ${r + 1}(row=${r}): ${cells.join("  ")}`);
       rowsWritten++;
     }
   }
@@ -949,8 +950,9 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 
 ━━━ КРИТИЧЕСКИЕ ПРАВИЛА ━━━
 - ВСЕГДА используй "ЦЕПОЧКИ ЗАГОЛОВКОВ" чтобы найти нужный столбец. Никогда не угадывай букву.
-- row = (номер строки Excel) - 1. Если в данных написано "28\t..." → row=27.
-- col = число после "col=" в цепочке. J(col=9) → col=9.
+- row: в данных каждая строка помечена явно: "28(row=27)" — используй ТОЛЬКО число в скобках (row=27), не 28.
+- col: используй число после "col=" в цепочке. J(col=9) → col=9. L(col=11) → col=11.
+- ПРИМЕР: строка "28(row=27): J28=316[2023/Проект]" → row=27, col=9.
 - Числа в data — числами, не строками.
 - Если данных нет в переданном контексте — спроси через ask_user, не выдумывай.`;
 
