@@ -822,7 +822,8 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
   "ask_user": "Вопрос к пользователю если данных недостаточно",
   "new_sheet": { "file_index": 0, "sheet_name": "Название листа", "data": [["Заголовок1","Заголовок2",...],[...]] },
   "cell_updates": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"value":76924,"formula":"=SUM(B5:B10)"}] }],
-  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"bgColor":"FFFFFF00"}] }]
+  "cell_styles": [{ "file_index": 0, "sheet_name": "Лист1", "changes": [{"row":10,"col":1,"bgColor":"FFFFFF00"}] }],
+  "doc_update": { "doc_name": "Описание проект факт", "text": "Полный обновлённый текст документа целиком" }
 }
 ═══════════════════════════════════════════════
 
@@ -855,6 +856,24 @@ const SYSTEM_PROMPT = `Ты — профессиональный аналити�
 
 Используй для покраски/жирности ячеек.
 bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелёный=FF92D050, красный=FFFF0000, синий=FF4472C4
+
+━━━ РЕЖИМ 4: ОБНОВЛЕНИЕ ТЕКСТОВОГО ДОКУМЕНТА (doc_update) ━━━
+
+Используй doc_update когда задание: "обнови текст", "перепиши описание", "замени период", "обнови аналитику в документе", "выдай текстом в файле".
+
+АЛГОРИТМ:
+1. Найди документ по имени (частичное совпадение с doc_name).
+2. Возьми оригинальный текст документа из контекста (он передаётся как =Документ «имя»=).
+3. Обнови только нужные части текста — цифры, периоды, выводы.
+4. Верни ПОЛНЫЙ текст документа целиком в поле "text" внутри doc_update.
+
+Формат:
+{"text": "Обновил текст документа «Описание»", "doc_update": {"doc_name": "Описание проект факт", "text": "...полный обновлённый текст..."}}
+
+ПРАВИЛА:
+- doc_name — часть имени файла (регистр не важен).
+- text внутри doc_update — ВЕСЬ текст документа, не фрагмент.
+- Сохраняй структуру и стиль оригинала, меняй только данные.
 
 ━━━ ЗАПРОС УТОЧНЕНИЙ (ask_user) ━━━
 
@@ -944,6 +963,7 @@ async function callAi(
   mutations?: { fileId: string; sheetName: string; data: CellValue[][] }[];
   styleMutations?: CellStyleMutation[];
   valueMutations?: CellValueMutation[];
+  docUpdates?: { docId: string; docName: string; text: string }[];
 }> {
   const selectedModel = settings.model === "__custom__" ? settings.customModel : settings.model;
   // Модели без поддержки vision — при наличии картинок автоматически переключаем на gpt-4o-mini
@@ -1200,11 +1220,25 @@ async function callAi(
     }
   }
 
+  // doc_update — обновление текстового документа
+  const docUpdates: { docId: string; docName: string; text: string }[] = [];
+  if (result.doc_update) {
+    const du = result.doc_update as { doc_name: string; text: string };
+    if (du.doc_name && du.text) {
+      const nameLower = du.doc_name.toLowerCase();
+      const targetDoc = docs.find(d => d.name.toLowerCase().includes(nameLower));
+      if (targetDoc) {
+        docUpdates.push({ docId: targetDoc.id, docName: targetDoc.name, text: du.text });
+      }
+    }
+  }
+
   return {
     text: (result.text as string) || "Готово!",
     mutations: mutations.length ? mutations : undefined,
     styleMutations: styleMutations.length ? styleMutations : undefined,
     valueMutations: valueMutations.length ? valueMutations : undefined,
+    docUpdates: docUpdates.length ? docUpdates : undefined,
   };
 }
 
@@ -2120,7 +2154,19 @@ export default function Index() {
         }));
       }
 
-      setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime(), chartData, chartTitle }]);
+      // doc_update — обновляем текст документа в state
+      if (result.docUpdates && result.docUpdates.length > 0) {
+        setDocs((prev) => prev.map((d) => {
+          const upd = result.docUpdates!.find(u => u.docId === d.id);
+          if (!upd) return d;
+          return { ...d, text: upd.text, html: undefined };
+        }));
+        const names = result.docUpdates.map(u => `«${u.docName}»`).join(", ");
+        const updMsg = result.text + `\n\n✅ Документ ${names} обновлён — открой его чтобы увидеть новый текст.`;
+        setMessages((prev) => [...prev, { role: "ai", text: updMsg, ts: getTime() }]);
+      } else {
+        setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime(), chartData, chartTitle }]);
+      }
     } catch (err) {
       const raw = err instanceof Error ? err.message : "Неизвестная ошибка";
       let msg = raw;
