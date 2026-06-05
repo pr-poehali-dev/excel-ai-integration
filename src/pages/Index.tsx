@@ -444,8 +444,38 @@ function getColHeaderChain(sh: SheetData, c: number, lastHR: number): string[] {
 // Строит полный контекст листа для ИИ.
 // Ключевая идея: каждая ячейка данных сопровождается ПОЛНОЙ смысловой цепочкой заголовков.
 // Пример: P12=1943 [Текущие запасы нефти / извлекаемые / A+B1]
-function buildSheetContext(sh: SheetData, maxDataRows = 500): string {
+function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
   const maxCols = getRealColCount(sh);
+  // Лимит токенов: если лист большой — переходим на компактный TSV (заголовки 1 раз, данные без тегов)
+  const totalDataRows = sh.cells.filter(r => r.some(c => c.v !== null)).length;
+  const COMPACT_THRESHOLD = 80; // строк — при превышении используем TSV
+  if (totalDataRows > COMPACT_THRESHOLD) {
+    const lines: string[] = [];
+    const lastHR = detectLastHeaderRow(sh);
+    // Заголовки — все строки до firstDataRow как TSV
+    for (let r = 0; r <= lastHR; r++) {
+      const row = sh.cells[r];
+      if (!row) continue;
+      lines.push(Array.from({ length: maxCols }, (_, c) => {
+        const v = row[c]?.v;
+        return v !== null && v !== undefined ? String(v) : "";
+      }).join("\t"));
+    }
+    lines.push("---");
+    // Данные — компактный TSV без повторения заголовков в каждой ячейке
+    let written = 0;
+    for (let r = lastHR + 1; r < sh.cells.length && written < maxDataRows; r++) {
+      const row = sh.cells[r];
+      if (!row || !row.some(c => c.v !== null)) continue;
+      lines.push(Array.from({ length: maxCols }, (_, c) => {
+        const v = row[c]?.v;
+        return v !== null && v !== undefined ? String(v) : "";
+      }).join("\t"));
+      written++;
+    }
+    if (written >= maxDataRows) lines.push(`[... ещё ${totalDataRows - written} строк не передано]`);
+    return lines.join("\n");
+  }
   const lastHR = detectLastHeaderRow(sh);
   const firstDataRow = lastHR + 1;
   const lines: string[] = [];
@@ -924,11 +954,11 @@ async function callAi(
   const baseUrl = settings.baseUrl.replace(/\/$/, "");
 
   // Строим контекст файлов — умный режим экономии токенов:
-  // • Активный лист → полный контекст (до 250 строк данных)
-  // • Другие листы упомянутые в запросе → полный контекст (до 150 строк)
-  // • Остальные листы → только заголовки столбцов (без данных, ~20 строк)
-  const ACTIVE_MAX_ROWS = 250;
-  const MENTIONED_MAX_ROWS = 150;
+  // • Активный лист → до 200 строк (крупные листы — компактный TSV, мелкие — подробный формат)
+  // • Упомянутый в запросе → до 120 строк
+  // • Остальные листы → только 5 строк превью
+  const ACTIVE_MAX_ROWS = 200;
+  const MENTIONED_MAX_ROWS = 120;
 
   // Определяем какие листы упомянуты в тексте запроса
   const promptLower = (prompt || "").toLowerCase();
