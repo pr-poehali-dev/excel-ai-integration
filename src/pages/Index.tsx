@@ -2088,27 +2088,41 @@ export default function Index() {
       const resolveRow = (sh: { cells: CellData[][] }, rowHint: number, rowText?: string): number => {
         if (!rowText) return rowHint;
         const needle = rowText.toLowerCase().trim();
-        // Ищем в первых 4 столбцах — в некоторых таблицах текст не в A, а в B или C
-        const getCellText = (r: number) => {
-          for (let c = 0; c < Math.min(4, sh.cells[r]?.length ?? 0); c++) {
-            const cell = sh.cells[r]?.[c];
-            const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).toLowerCase().trim();
-            if (val && val.length > 3) return val;
-          }
-          return "";
-        };
-        // Точное вхождение
-        for (let r = 0; r < sh.cells.length; r++) {
-          const val = getCellText(r);
-          if (val && (val.includes(needle) || needle.includes(val))) return r;
-        }
-        // Частичное — все слова длиной ≥4 присутствуют в строке
         const words = needle.split(/\s+/).filter(w => w.length >= 4);
-        if (words.length > 0) {
-          for (let r = 0; r < sh.cells.length; r++) {
-            const val = getCellText(r);
-            if (val && words.every(w => val.includes(w))) return r;
+
+        // Собираем текст из строки — ищем в любом столбце до первых 50 непустых,
+        // останавливаемся после 50 подряд пустых столбцов
+        const getRowText = (r: number): string[] => {
+          const row = sh.cells[r];
+          if (!row) return [];
+          const results: string[] = [];
+          let emptyCols = 0;
+          for (let c = 0; c < row.length; c++) {
+            const cell = row[c];
+            const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).trim();
+            if (!val) { emptyCols++; if (emptyCols > 50) break; continue; }
+            emptyCols = 0;
+            if (val.length > 2) results.push(val.toLowerCase());
           }
+          return results;
+        };
+
+        // Проходим все строки, пропуская пустые (но не останавливаясь на них —
+        // останавливаемся только после 50 подряд пустых строк)
+        let emptyRows = 0;
+        for (let r = 0; r < sh.cells.length; r++) {
+          const texts = getRowText(r);
+          if (texts.length === 0) {
+            emptyRows++;
+            if (emptyRows > 50) break;
+            continue;
+          }
+          emptyRows = 0;
+          const combined = texts.join(" ");
+          // Точное совпадение
+          if (combined.includes(needle) || needle.includes(combined)) return r;
+          // Частичное — все ключевые слова есть в строке
+          if (words.length >= 2 && words.every(w => combined.includes(w))) return r;
         }
         return rowHint;
       };
