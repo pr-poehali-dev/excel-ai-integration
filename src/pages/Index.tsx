@@ -152,6 +152,8 @@ interface ChatMessage {
   chartTitle?: string;
   ask_user?: string;        // вопрос ИИ для уточнения — показываем интерактивную карточку
   pendingPrompt?: string;   // исходный промпт пользователя, ждёт уточнения
+  docText?: string;         // готовый текст документа — показываем прямо в чате с кнопкой копировать
+  docName?: string;         // имя документа для заголовка блока
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -925,6 +927,28 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 
 type CellStyleChange = { row: number; col: number; bgColor?: string; fontColor?: string; bold?: boolean };
 type CellStyleMutation = { fileId: string; sheetName: string; changes: CellStyleChange[] };
+
+function DocTextBlock({ text, name }: { text: string; name?: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="mt-3 rounded-xl border border-primary/30 overflow-hidden" style={{ background: "rgba(52,211,153,0.04)" }}>
+      <div className="flex items-center justify-between px-3 py-2 border-b border-primary/20">
+        <span className="text-[10px] font-semibold text-primary flex items-center gap-1.5">
+          <Icon name="FileText" size={11} />
+          {name || "Текст документа"}
+        </span>
+        <button
+          className="text-[10px] px-2 py-0.5 rounded-md border border-primary/40 text-primary hover:bg-primary/10 transition-colors flex items-center gap-1"
+          onClick={() => { navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
+        >
+          <Icon name={copied ? "Check" : "Copy"} size={10} />
+          {copied ? "Скопировано!" : "Скопировать"}
+        </button>
+      </div>
+      <pre className="px-3 py-2.5 text-[11px] leading-relaxed text-foreground/90 whitespace-pre-wrap font-sans max-h-96 overflow-y-auto">{text}</pre>
+    </div>
+  );
+}
 
 function extractJson(raw: string): Record<string, unknown> {
   // 1. Убираем markdown-блоки (```json ... ``` в любом месте)
@@ -2154,16 +2178,23 @@ export default function Index() {
         }));
       }
 
-      // doc_update — обновляем текст документа в state
+      // doc_update — показываем текст прямо в чате + обновляем в state
       if (result.docUpdates && result.docUpdates.length > 0) {
+        const upd = result.docUpdates[0];
+        // Обновляем текст документа в state чтобы при открытии тоже был новый
         setDocs((prev) => prev.map((d) => {
-          const upd = result.docUpdates!.find(u => u.docId === d.id);
-          if (!upd) return d;
-          return { ...d, text: upd.text, html: undefined };
+          const u = result.docUpdates!.find(x => x.docId === d.id);
+          if (!u) return d;
+          return { ...d, text: u.text, html: undefined };
         }));
-        const names = result.docUpdates.map(u => `«${u.docName}»`).join(", ");
-        const updMsg = result.text + `\n\n✅ Документ ${names} обновлён — открой его чтобы увидеть новый текст.`;
-        setMessages((prev) => [...prev, { role: "ai", text: updMsg, ts: getTime() }]);
+        // Показываем текст прямо в чате с кнопкой копировать
+        setMessages((prev) => [...prev, {
+          role: "ai",
+          text: result.text,
+          ts: getTime(),
+          docText: upd.text,
+          docName: upd.docName,
+        }]);
       } else {
         setMessages((prev) => [...prev, { role: "ai", text: result.text, ts: getTime(), chartData, chartTitle }]);
       }
@@ -2680,6 +2711,9 @@ export default function Index() {
                       </div>
                     )}
                     <p dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }} />
+
+                    {/* ── docText: готовый текст документа прямо в чате ── */}
+                    {msg.docText && <DocTextBlock text={msg.docText} name={msg.docName} />}
 
                     {/* ── ask_user: карточка с вопросом ИИ ── */}
                     {msg.ask_user && msg.role === "ai" && (() => {
