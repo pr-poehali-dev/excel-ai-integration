@@ -2964,7 +2964,7 @@ export default function Index() {
                   placeholder={isListening ? "🎤 Говорите..." : (files.length === 0 && docs.length === 0 ? "Сначала загрузи файл..." : "Задание для ИИ...")}
                   disabled={aiThinking}
                   rows={2}
-                  className={`flex-1 px-3 py-2 rounded-lg border text-xs text-foreground placeholder:text-muted-foreground focus:outline-none resize-none transition-all scrollbar-thin ${
+                  className={`flex-1 px-3 py-2 rounded-lg border text-xs text-foreground placeholder:text-muted-foreground focus:outline-none resize-y transition-all scrollbar-thin min-h-[40px] max-h-[300px] ${
                     isListening ? "border-red-500/40 bg-red-500/5" : "border-border/50 focus:border-primary/40"
                   }`}
                   style={{ background: isListening ? undefined : "rgba(255,255,255,0.03)" }}
@@ -3098,37 +3098,64 @@ export default function Index() {
               {prompts.map((p) => (
                 <div key={p.id} className={`rounded-xl border transition-all ${p.enabled ? "border-primary/40 bg-primary/5" : "border-border/40"}`}>
                   <div className="flex items-start gap-3 p-3">
+                    {/* Галочка вкл/выкл */}
                     <button onClick={() => {
                       const updated = prompts.map(pp => pp.id === p.id ? { ...pp, enabled: !pp.enabled } : pp);
-                      setPrompts(updated);
-                      savePrompts(updated);
+                      setPrompts(updated); savePrompts(updated);
                     }} className={`w-5 h-5 rounded flex items-center justify-center flex-shrink-0 mt-0.5 border-2 transition-all ${p.enabled ? "bg-primary border-primary" : "border-border/60 hover:border-primary/50"}`}>
                       {p.enabled && <Icon name="Check" size={11} className="text-primary-foreground" />}
                     </button>
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-semibold text-foreground mb-1">{p.label}</p>
+                      {/* Название — кликабельное для редактирования */}
+                      {editingPrompt === p.id ? (
+                        <input
+                          defaultValue={p.label}
+                          onBlur={(e) => {
+                            const updated = prompts.map(pp => pp.id === p.id ? { ...pp, label: e.target.value || pp.label } : pp);
+                            setPrompts(updated); savePrompts(updated);
+                          }}
+                          className="w-full text-xs font-semibold text-foreground bg-background/50 border border-primary/30 rounded px-2 py-0.5 outline-none focus:border-primary/60 mb-1"
+                          placeholder="Название промпта"
+                        />
+                      ) : (
+                        <p
+                          className="text-xs font-semibold text-foreground mb-1 cursor-pointer hover:text-primary transition-colors"
+                          title="Нажми чтобы переименовать"
+                          onClick={() => setEditingPrompt(p.id)}
+                        >{p.label}</p>
+                      )}
+                      {/* Текст промпта */}
                       {editingPrompt === p.id ? (
                         <textarea
                           defaultValue={p.text}
                           onBlur={(e) => {
                             const updated = prompts.map(pp => pp.id === p.id ? { ...pp, text: e.target.value } : pp);
-                            setPrompts(updated);
-                            savePrompts(updated);
-                            setEditingPrompt(null);
+                            setPrompts(updated); savePrompts(updated);
                           }}
-                          autoFocus
                           rows={5}
-                          className="w-full text-xs text-foreground bg-background/50 border border-primary/30 rounded-lg px-3 py-2 resize-none outline-none focus:border-primary/60 font-mono"
+                          className="w-full text-xs text-foreground bg-background/50 border border-primary/30 rounded-lg px-3 py-2 resize-y outline-none focus:border-primary/60 font-mono"
                         />
                       ) : (
                         <p className="text-[11px] text-muted-foreground leading-relaxed line-clamp-3">{p.text}</p>
                       )}
                     </div>
-                    <button onClick={() => setEditingPrompt(editingPrompt === p.id ? null : p.id)}
-                      className="text-muted-foreground hover:text-foreground transition-colors flex-shrink-0 mt-0.5"
-                      title="Редактировать текст промпта">
-                      <Icon name={editingPrompt === p.id ? "Check" : "Pencil"} size={13} />
-                    </button>
+                    <div className="flex flex-col gap-1 flex-shrink-0 mt-0.5">
+                      {/* Редактировать */}
+                      <button onClick={() => setEditingPrompt(editingPrompt === p.id ? null : p.id)}
+                        className="text-muted-foreground hover:text-foreground transition-colors"
+                        title={editingPrompt === p.id ? "Сохранить" : "Редактировать"}>
+                        <Icon name={editingPrompt === p.id ? "Check" : "Pencil"} size={13} />
+                      </button>
+                      {/* Удалить */}
+                      <button onClick={() => {
+                        if (!confirm(`Удалить промпт "${p.label}"?`)) return;
+                        const updated = prompts.filter(pp => pp.id !== p.id);
+                        setPrompts(updated); savePrompts(updated);
+                        if (editingPrompt === p.id) setEditingPrompt(null);
+                      }} className="text-muted-foreground hover:text-red-400 transition-colors" title="Удалить промпт">
+                        <Icon name="Trash2" size={13} />
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
