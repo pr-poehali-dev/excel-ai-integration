@@ -494,10 +494,15 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
     let written = 0;
     for (let r = lastHR + 1; r < sh.cells.length && written < maxDataRows; r++) {
       const row = sh.cells[r];
-      if (!row || !row.some(c => c.v !== null)) continue;
+      if (!row) continue;
+      const hasData = row.some(c => c.v !== null && c.v !== undefined || (c.w && c.w.trim()));
+      if (!hasData) continue;
       const cells = Array.from({ length: maxCols }, (_, c) => {
-        const v = row[c]?.v;
-        return v !== null && v !== undefined ? String(v) : "";
+        const cell = row[c];
+        if (!cell) return "";
+        if (cell.v !== null && cell.v !== undefined) return String(cell.v);
+        if (cell.w && cell.w.trim()) return cell.w.trim();
+        return "";
       });
       lines.push(`${r + 1}(row=${r})\t` + cells.join("\t"));
       written++;
@@ -550,7 +555,9 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
 
   for (let r = firstDataRow; r < sh.cells.length && rowsWritten < MAX_DATA_ROWS; r++) {
     const row = sh.cells[r];
-    if (!row || !row.some(c => c.v !== null)) continue;
+    if (!row) continue;
+    const hasData = row.some(c => c.v !== null && c.v !== undefined || (c.w && c.w.trim()));
+    if (!hasData) continue;
 
     // Проверяем: строка-разделитель (одно широкое объединение на всю ширину)?
     // Такие строки тоже выводим, но помечаем как разделитель
@@ -564,8 +571,12 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
       const owner = getMergeOwner(sh, r, c);
       if (owner) continue;
       const cell = row[c] ?? { v: null };
-      if (cell.v === null) continue;
-      const val = typeof cell.v === "number" ? String(cell.v) : (cell.w ?? String(cell.v));
+      const hasVal = cell.v !== null && cell.v !== undefined;
+      const hasW = cell.w && cell.w.trim();
+      if (!hasVal && !hasW) continue;
+      const val = hasVal
+        ? (typeof cell.v === "number" ? String(cell.v) : (cell.w ?? String(cell.v)))
+        : cell.w!.trim();
       const chain = colChains.get(c);
       // Для строк-разделителей заголовок столбца не добавляем (там текст на всю строку)
       const tag = (!isGroupHeader && chain && chain.length > 0)
