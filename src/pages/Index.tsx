@@ -923,26 +923,43 @@ async function callAi(
     : selectedModel;
   const baseUrl = settings.baseUrl.replace(/\/$/, "");
 
-  // Строим контекст файлов — все листы передаются полностью (активный + источники данных)
+  // Строим контекст файлов — умный режим экономии токенов:
+  // • Активный лист → полный контекст (до 250 строк данных)
+  // • Другие листы упомянутые в запросе → полный контекст (до 150 строк)
+  // • Остальные листы → только заголовки столбцов (без данных, ~20 строк)
+  const ACTIVE_MAX_ROWS = 250;
+  const MENTIONED_MAX_ROWS = 150;
+
+  // Определяем какие листы упомянуты в тексте запроса
+  const promptLower = (prompt || "").toLowerCase();
+  const isMentioned = (sheetName: string) =>
+    promptLower.includes(sheetName.toLowerCase()) ||
+    promptLower.includes(sheetName.toLowerCase().slice(0, 8));
+
   const contextParts: string[] = [];
-  // Общий бюджет токенов на все листы. Активный лист получает больше, остальные делят остаток.
-  const ACTIVE_MAX_ROWS = 300;
-  const OTHER_MAX_ROWS = 150; // достаточно для поиска нужных данных
   files.forEach((f, fi) => {
     const roleLabel = f.role === "main" ? " [ОСНОВНОЙ]" : f.role === "reference" ? " [ОБРАЗЕЦ]" : "";
     contextParts.push(`=== Excel-файл ${fi} «${f.name}»${roleLabel} ===`);
     contextParts.push(`Листы: ${f.sheets.map((s, si) => `«${s.name}»${si === f.activeSheet ? " (активный)" : ""}`).join(", ")}`);
     f.sheets.forEach((sh, si) => {
       const isActive = si === f.activeSheet;
+      const mentioned = isMentioned(sh.name);
       const totalRows = sh.cells.filter(r => r.some(c => c.v !== null)).length;
       const realCols = getRealColCount(sh);
-      const maxRows = isActive ? ACTIVE_MAX_ROWS : OTHER_MAX_ROWS;
-      const truncated = totalRows > maxRows;
-      const marker = isActive
-        ? ` [АКТИВНЫЙ ЛИСТ — сюда записывать результат, строк: ${totalRows}, столбцов: ${realCols}]`
-        : ` [лист-источник данных, строк: ${totalRows}${truncated ? `, показано ${maxRows}` : ""}]`;
-      contextParts.push(`--- Лист «${sh.name}»${marker} ---`);
-      contextParts.push(sheetToText(sh, true, maxRows)); // всегда полный контекст с заголовками
+
+      if (isActive) {
+        // Активный лист — полный контекст
+        contextParts.push(`--- Лист «${sh.name}» [АКТИВНЫЙ — сюда записывать результат, строк: ${totalRows}, столбцов: ${realCols}] ---`);
+        contextParts.push(sheetToText(sh, true, ACTIVE_MAX_ROWS));
+      } else if (mentioned) {
+        // Лист упомянут в запросе — тоже полный контекст
+        contextParts.push(`--- Лист «${sh.name}» [источник данных, строк: ${totalRows}] ---`);
+        contextParts.push(sheetToText(sh, true, MENTIONED_MAX_ROWS));
+      } else {
+        // Остальные листы — только заголовки столбцов (без данных строк)
+        contextParts.push(`--- Лист «${sh.name}» [не активный, строк: ${totalRows} — данные не переданы, упомяни имя листа в запросе чтобы получить доступ] ---`);
+        contextParts.push(sheetToText(sh, false)); // краткий TSV-превью, 5 строк
+      }
     });
   });
 
