@@ -968,7 +968,7 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 ━━━ КРИТИЧЕСКИЕ ПРАВИЛА ━━━
 - ВСЕГДА используй "ЦЕПОЧКИ ЗАГОЛОВКОВ" чтобы найти нужный столбец. Никогда не угадывай букву.
 - col: используй число после "col=" в цепочке. J(col=9) → col=9. N(col=13) → col=13.
-- row_text ОБЯЗАТЕЛЕН: всегда указывай текст из столбца A нужной строки. Пример: "Действующий фонд добывающих скважин на конец года". Код сам найдёт правильный row по этому тексту — даже если ты ошибёшься с номером.
+- row_text ОБЯЗАТЕЛЕН: указывай текст показателя из нужной строки (из столбца A или B — где написано название). Пример: "Действующий фонд добывающих скважин на конец года". Код ищет по первым 4 столбцам — найдёт верную строку даже если ты ошибёшься с row.
 - row: укажи приблизительный номер (можно 0 если не знаешь) — row_text важнее.
 - Числа в data — числами, не строками.
 - Если данных нет в переданном контексте — спроси через ask_user, не выдумывай.`;
@@ -2088,19 +2088,29 @@ export default function Index() {
       const resolveRow = (sh: { cells: CellData[][] }, rowHint: number, rowText?: string): number => {
         if (!rowText) return rowHint;
         const needle = rowText.toLowerCase().trim();
+        // Ищем в первых 4 столбцах — в некоторых таблицах текст не в A, а в B или C
+        const getCellText = (r: number) => {
+          for (let c = 0; c < Math.min(4, sh.cells[r]?.length ?? 0); c++) {
+            const cell = sh.cells[r]?.[c];
+            const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).toLowerCase().trim();
+            if (val && val.length > 3) return val;
+          }
+          return "";
+        };
+        // Точное вхождение
         for (let r = 0; r < sh.cells.length; r++) {
-          const cell = sh.cells[r]?.[0];
-          const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).toLowerCase().trim();
+          const val = getCellText(r);
           if (val && (val.includes(needle) || needle.includes(val))) return r;
         }
-        // Попробуем частичное совпадение по первым словам (≥3 символов)
-        const words = needle.split(/\s+/).filter(w => w.length >= 3);
-        for (let r = 0; r < sh.cells.length; r++) {
-          const cell = sh.cells[r]?.[0];
-          const val = (cell?.w ?? (cell?.v != null ? String(cell.v) : "")).toLowerCase().trim();
-          if (val && words.length > 0 && words.every(w => val.includes(w))) return r;
+        // Частичное — все слова длиной ≥4 присутствуют в строке
+        const words = needle.split(/\s+/).filter(w => w.length >= 4);
+        if (words.length > 0) {
+          for (let r = 0; r < sh.cells.length; r++) {
+            const val = getCellText(r);
+            if (val && words.every(w => val.includes(w))) return r;
+          }
         }
-        return rowHint; // fallback на то что дал ИИ
+        return rowHint;
       };
 
       // Применяем стили к ячейкам — пишем в cells[] и в оригинальный workbook
