@@ -456,25 +456,49 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
   if (totalDataRows > COMPACT_THRESHOLD) {
     const lines: string[] = [];
     const lastHR = detectLastHeaderRow(sh);
-    // Заголовки — все строки до firstDataRow как TSV
+
+    // Строим карту: для каждой ячейки заголовка — реальное значение с учётом объединений
+    // Объединённые ячейки: значение владельца копируется во все дочерние ячейки
+    const resolveHeaderCell = (r: number, c: number): string => {
+      const owner = getMergeOwner(sh, r, c);
+      const cell = owner ? sh.cells[owner.r]?.[owner.c] : sh.cells[r]?.[c];
+      const v = cell?.v;
+      return v !== null && v !== undefined ? String(v) : "";
+    };
+
+    // Строим цепочку заголовков для каждого столбца (как getColHeaderChain но для TSV)
+    // Формат первой строки: A=col0 | B=col1 | ... (чтобы ИИ знал букву столбца)
+    const colLetters = Array.from({ length: maxCols }, (_, c) => `${colLetter(c)}=col${c}`);
+    lines.push("СТОЛБЦЫ: " + colLetters.join(" | "));
+
+    // Заголовки — каждая строка, объединения раскрыты
+    lines.push("ЗАГОЛОВКИ:");
     for (let r = 0; r <= lastHR; r++) {
       const row = sh.cells[r];
-      if (!row) continue;
-      lines.push(Array.from({ length: maxCols }, (_, c) => {
-        const v = row[c]?.v;
-        return v !== null && v !== undefined ? String(v) : "";
-      }).join("\t"));
+      if (!row && !sh.merges.some(m => m.r1 <= r && r <= m.r2)) continue;
+      const cells = Array.from({ length: maxCols }, (_, c) => resolveHeaderCell(r, c));
+      // Пропускаем полностью пустые строки заголовков
+      if (cells.every(v => !v)) continue;
+      lines.push(cells.join("\t"));
     }
-    lines.push("---");
-    // Данные — компактный TSV без повторения заголовков в каждой ячейке
+
+    // Сводная таблица заголовков столбцов (цепочка сверху вниз для каждого столбца)
+    lines.push("ЦЕПОЧКИ ЗАГОЛОВКОВ (столбец → полный путь):");
+    for (let c = 0; c < maxCols; c++) {
+      const chain = getColHeaderChain(sh, c, lastHR);
+      if (chain.length > 0) lines.push(`  ${colLetter(c)}(col=${c}) = "${chain.join(" / ")}"`);
+    }
+
+    lines.push("ДАННЫЕ (строки ниже, первая колонка = A):");
     let written = 0;
     for (let r = lastHR + 1; r < sh.cells.length && written < maxDataRows; r++) {
       const row = sh.cells[r];
       if (!row || !row.some(c => c.v !== null)) continue;
-      lines.push(Array.from({ length: maxCols }, (_, c) => {
+      const cells = Array.from({ length: maxCols }, (_, c) => {
         const v = row[c]?.v;
         return v !== null && v !== undefined ? String(v) : "";
-      }).join("\t"));
+      });
+      lines.push(`${r + 1}\t` + cells.join("\t"));
       written++;
     }
     if (written >= maxDataRows) lines.push(`[... ещё ${totalDataRows - written} строк не передано]`);
@@ -908,17 +932,25 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 - [лист: "Название"] — остальные листы того же файла = источники данных
 - Файлы с ролью [ОБРАЗЕЦ] — берёшь из них структуру/формат
 
-АЛГОРИТМ поиска данных:
-ШАГ 1. Найди нужный лист по имени из задания (например "лист ГТС" → ищи лист с таким именем).
-ШАГ 2. В этом листе найди нужные столбцы по ЦЕПОЧКЕ заголовков (не по букве).
-ШАГ 3. Найди нужные строки по значению в столбце A (названия объектов, пластов, скважин).
-ШАГ 4. Собери данные в таблицу и верни new_sheet.
-ШАГ 5. В поле "text" — кратко: откуда взял данные, что сделал.
+АЛГОРИТМ поиска нужного столбца (САМОЕ ВАЖНОЕ):
+ШАГ 1. Найди нужный лист по имени из задания.
+ШАГ 2. Смотри секцию "ЦЕПОЧКИ ЗАГОЛОВКОВ" — там каждый столбец описан как: J(col=9) = "2023 / Проект"
+ШАГ 3. Найди столбец по ПОЛНОЙ цепочке — год + подзаголовок. Например "2023 / Проект" → col=9 → буква J.
+ШАГ 4. Найди нужные строки по значению в столбце A (названия показателей).
+ШАГ 5. row и col — всегда 0-based. Строка Excel 1 = row 0. Столбец A = col 0, J = col 9, N = col 13.
+
+КАК ЧИТАТЬ TSV-ФОРМАТ (большие таблицы):
+- Строка "СТОЛБЦЫ:" — буква и номер каждого столбца: A=col0, B=col1, ...
+- Строки "ЗАГОЛОВКИ:" — несколько строк, объединённые ячейки раскрыты (значение повторяется)
+- Строки "ЦЕПОЧКИ ЗАГОЛОВКОВ:" — итоговый путь каждого столбца: J(col=9) = "2023 / Проект"
+- Строки "ДАННЫЕ:" — первая колонка = номер строки Excel, остальные = значения столбцов A, B, C...
+  Пример строки данных: "28\tДействующий фонд\t\t224\t\t263\t\t282\t\t316"
+  Здесь строка Excel 28, значение в col=9 (J) = 316 — это "2023 / Проект"
 
 ━━━ КРИТИЧЕСКИЕ ПРАВИЛА ━━━
-- Буква столбца (K, L, M...) НЕ определяет смысл. Только цепочка в [...] тегах.
-- K=col10, L=col11, M=col12 — не перепутай.
-- Если нашёл столбец с буквой L → col=11.
+- ВСЕГДА используй "ЦЕПОЧКИ ЗАГОЛОВКОВ" чтобы найти нужный столбец. Никогда не угадывай букву.
+- row = (номер строки Excel) - 1. Если в данных написано "28\t..." → row=27.
+- col = число после "col=" в цепочке. J(col=9) → col=9.
 - Числа в data — числами, не строками.
 - Если данных нет в переданном контексте — спроси через ask_user, не выдумывай.`;
 
