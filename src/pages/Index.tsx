@@ -1136,6 +1136,12 @@ async function callAi(
 
   const textBlock = `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\nЗАДАНИЕ: ${prompt || "(см. изображения)"}
 
+КРИТИЧЕСКИЕ ПРАВИЛА ПО РАБОТЕ С ЦИФРАМИ:
+1. Используй ТОЛЬКО цифры из предоставленных данных выше. НИКОГДА не придумывай и не округляй значения.
+2. Перед каждой цифрой в тексте мысленно проверь: "Эта цифра есть в данных?" Если не уверен — не пиши её, напиши "данные не предоставлены".
+3. Сравнивая проект и факт: всегда указывай оба значения (проект и факт) с единицами измерения.
+4. Если одно из значений отсутствует в данных — явно укажи это, не подставляй похожие цифры.
+
 ⚠️ ОБЯЗАТЕЛЬНО: твой ответ должен быть ТОЛЬКО валидным JSON-объектом. Никакого текста до или после. Никаких \`\`\`json\`\`\` обёрток. Начни ответ с символа { и заверши символом }.`;
 
   // Собираем все изображения: скриншоты + PDF рабочих документов + PDF из базы знаний
@@ -1176,11 +1182,13 @@ async function callAi(
     : effectiveModel;
 
   // Модели поддерживающие принудительный JSON-режим (response_format)
-  // Qwen, Llama и ряд других НЕ поддерживают — передавать им не нужно (вернут ошибку 400)
+  // Llama и ряд других НЕ поддерживают — передавать им не нужно (вернут ошибку 400)
   const JSON_MODE_MODELS = [
     "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4",
     "openai/gpt-4o", "openai/gpt-4o-mini",
     "deepseek/deepseek-chat", "deepseek/deepseek-r1",
+    "qwen/qwen-plus", "qwen/qwen-turbo", "qwen/qwen-max",
+    "qwen-plus", "qwen-turbo", "qwen-max",
   ];
   const supportsJsonMode = JSON_MODE_MODELS.some(m => finalModel.includes(m.split("/").pop()!))
     && allImageParts.length === 0; // vision + json_object несовместимы
@@ -1230,10 +1238,9 @@ async function callAi(
   if (result.cell_styles) console.log("[AI CELL_STYLES]", JSON.stringify(result.cell_styles));
   if (result.cell_updates) console.log("[AI CELL_UPDATES]", JSON.stringify(result.cell_updates));
 
-  // Модель ответила текстом вместо JSON — показываем понятную ошибку
+  // Модель ответила текстом вместо JSON — показываем ответ как есть
   if (result._raw_fallback) {
-    const hint = "⚠️ Модель ответила текстом вместо JSON. Попробуй: 1) Переформулировать запрос, 2) Сменить модель на GPT-4o или DeepSeek, 3) Уточнить задание.";
-    return { text: hint };
+    return { text: result.text as string };
   }
 
   // ask_user — ИИ запрашивает уточнение перед выполнением
