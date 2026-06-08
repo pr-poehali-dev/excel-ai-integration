@@ -15,6 +15,15 @@ import {
 } from "@/types/oilfield";
 import func2url from "../../backend/func2url.json";
 
+interface AiSettings { apiKey: string; baseUrl: string; model: string; customModel: string; }
+function loadAiSettings(): AiSettings {
+  try {
+    const s = localStorage.getItem("datamind_ai_settings");
+    if (s) return { baseUrl: "https://routerai.ru/api/v1", model: "deepseek/deepseek-chat", customModel: "", ...JSON.parse(s) };
+  } catch { /* */ }
+  return { apiKey: "", baseUrl: "https://routerai.ru/api/v1", model: "deepseek/deepseek-chat", customModel: "" };
+}
+
 const EXPORT_URL = (func2url as Record<string, string>)["export-xlsx"] ?? "";
 
 function parseXlsxLocally(file: File): Promise<OilfieldData[]> {
@@ -94,6 +103,8 @@ export default function Oilfield() {
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [aiAnalyzing, setAiAnalyzing] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   const selected = fields[selectedIdx];
 
@@ -176,6 +187,70 @@ export default function Oilfield() {
     }
   };
 
+  const runAiAnalysis = async () => {
+    const settings = loadAiSettings();
+    if (!settings.apiKey) {
+      setAiError("Нет API ключа — настрой его в главном приложении (шестерёнка)");
+      return;
+    }
+    setAiAnalyzing(true);
+    setAiError(null);
+    try {
+      const model = settings.model === "__custom__" ? settings.customModel : settings.model;
+      // Строим таблицу текущих данных для ИИ
+      const yearsLine = ["Показатель", ...selected.years.map(String)].join("\t");
+      const dataLines = selected.chart1Rows.map(row =>
+        [row.indicator, ...row.values.map(v => v !== null ? String(v) : "")].join("\t")
+      );
+      const tableText = [yearsLine, ...dataLines].join("\n");
+
+      const systemPrompt = `Ты аналитик нефтяных месторождений. Тебе дана таблица изменений показателей разработки по годам (в %). 
+Проанализируй данные и верни ТОЛЬКО JSON объект вида:
+{"rows": [{"indicator": "название", "values": [число_или_null, ...]}, ...]}
+где values — массив чисел для каждого года в том же порядке что в исходной таблице.
+Ты можешь скорректировать значения или рассчитать пустые клетки на основе взаимосвязей показателей.
+Если данных нет для расчёта — оставь null. Верни ВСЕ ${selected.chart1Rows.length} строк в том же порядке.`;
+
+      const userPrompt = `Месторождение: ${selected.name}\n\nТаблица изменений показателей (%):\n${tableText}\n\nПроанализируй и верни скорректированные данные в JSON.`;
+
+      const resp = await fetch(`${settings.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+          max_tokens: 2000,
+          temperature: 0.1,
+          response_format: { type: "json_object" },
+        }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const json = await resp.json() as { choices: { message: { content: string } }[] };
+      const raw = json.choices?.[0]?.message?.content ?? "{}";
+      let parsed: { rows?: { indicator: string; values: (number | null)[] }[] };
+      try { parsed = JSON.parse(raw); } catch { throw new Error("ИИ вернул некорректный JSON"); }
+
+      if (parsed.rows && Array.isArray(parsed.rows)) {
+        const updatedRows = selected.chart1Rows.map((origRow, i) => {
+          const aiRow = parsed.rows!.find(r => r.indicator === origRow.indicator) || parsed.rows![i];
+          if (!aiRow) return origRow;
+          const values = selected.years.map((_, yi) => {
+            const v = aiRow.values[yi];
+            return (v !== null && v !== undefined && !isNaN(Number(v))) ? Number(v) : origRow.values[yi];
+          });
+          return { ...origRow, values };
+        });
+        updateField({ ...selected, chart1Rows: updatedRows });
+      } else {
+        throw new Error("ИИ не вернул данные в ожидаемом формате");
+      }
+    } catch (e) {
+      setAiError(e instanceof Error ? e.message : "Ошибка анализа");
+    } finally {
+      setAiAnalyzing(false);
+    }
+  };
+
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "#f5f5f5", fontFamily: "Calibri, Arial, sans-serif" }}>
       {/* Шапка в стиле Excel */}
@@ -216,6 +291,19 @@ export default function Oilfield() {
             </div>
           </label>
 
+          {activeTab === "chart1" && (
+            <button
+              onClick={runAiAnalysis}
+              disabled={aiAnalyzing}
+              className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition disabled:opacity-50"
+              style={{ background: "rgba(52,211,153,0.15)", borderColor: "rgba(52,211,153,0.5)", color: "#34d399" }}
+            >
+              {aiAnalyzing
+                ? <><Icon name="Loader2" size={13} className="spinner" />Анализирую...</>
+                : <><Icon name="Sparkles" size={13} />ИИ-анализ</>}
+            </button>
+          )}
+
           <button
             onClick={handleExport}
             disabled={exporting}
@@ -252,6 +340,14 @@ export default function Oilfield() {
           ))}
         </div>
       </div>
+
+      {aiError && (
+        <div className="flex items-center gap-2 px-4 py-2 text-xs border-b border-red-300/40" style={{ background: "rgba(220,38,38,0.1)", color: "#fca5a5" }}>
+          <Icon name="AlertCircle" size={13} />
+          {aiError}
+          <button onClick={() => setAiError(null)} className="ml-auto opacity-60 hover:opacity-100"><Icon name="X" size={12} /></button>
+        </div>
+      )}
 
       <div className="flex flex-1 overflow-hidden">
         {/* Боковая панель месторождений */}
