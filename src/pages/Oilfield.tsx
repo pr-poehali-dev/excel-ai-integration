@@ -181,29 +181,38 @@ export default function Oilfield() {
     }
   };
 
-  // Извлекает первый валидный JSON-объект из произвольного текста
+  // Извлекает все JSON-объекты из текста и возвращает самый "полезный"
   const extractJsonFromText = (text: string): Record<string, unknown> | null => {
-    // Ищем все позиции открывающих скобок
-    for (let i = 0; i < text.length; i++) {
-      if (text[i] !== '{') continue;
-      // Пробуем разобрать начиная с этой позиции — берём всё до конца и режем если не парсится
+    const candidates: Record<string, unknown>[] = [];
+    let i = 0;
+    while (i < text.length) {
+      if (text[i] !== '{') { i++; continue; }
+      // Находим закрывающую скобку с учётом вложенности
       let depth = 0;
-      for (let j = i; j < text.length; j++) {
+      let j = i;
+      while (j < text.length) {
         if (text[j] === '{') depth++;
-        else if (text[j] === '}') { depth--; }
-        if (depth === 0) {
-          const candidate = text.slice(i, j + 1);
-          try {
-            const obj = JSON.parse(candidate) as Record<string, unknown>;
-            // Проверяем что это содержательный объект (есть вложенные годы или rows)
-            const keys = Object.keys(obj);
-            if (keys.some(k => /^\d{4}$/.test(k)) || obj.rows || obj.analysis) return obj;
-          } catch { /* продолжаем */ }
-          break;
-        }
+        else if (text[j] === '}') depth--;
+        if (depth === 0) break;
+        j++;
       }
+      if (depth === 0) {
+        const candidate = text.slice(i, j + 1);
+        try {
+          const obj = JSON.parse(candidate) as Record<string, unknown>;
+          candidates.push(obj);
+        } catch { /* не JSON */ }
+      }
+      i++;
     }
-    return null;
+    if (candidates.length === 0) return null;
+    // Предпочитаем объект с годами или analysis/rows, иначе самый большой
+    return (
+      candidates.find(o => Object.keys(o).some(k => /^\d{4}$/.test(k))) ??
+      candidates.find(o => o.analysis) ??
+      candidates.find(o => o.rows) ??
+      candidates.reduce((a, b) => JSON.stringify(a).length >= JSON.stringify(b).length ? a : b)
+    );
   };
 
   // Применяет данные из ответа ИИ к таблице
@@ -577,6 +586,21 @@ export default function Oilfield() {
               value={pasteText}
               onChange={e => setPasteText(e.target.value)}
             />
+            {pasteText.length > 0 && (() => {
+              const found = extractJsonFromText(pasteText);
+              const yearKeys = found ? Object.keys(found.analysis as object || found).filter(k => /^\d{4}$/.test(k)) : [];
+              return (
+                <div className="px-4 py-2 text-xs border-t border-gray-100" style={{
+                  background: found && (yearKeys.length > 0 || (found as Record<string,unknown>).rows) ? "#f0fff4" : "#fff8f0",
+                  color: found && (yearKeys.length > 0 || (found as Record<string,unknown>).rows) ? "#276749" : "#c05621"
+                }}>
+                  {!found && "⚠ JSON не найден — убедись что вставил полный ответ ИИ включая фигурные скобки"}
+                  {found && yearKeys.length > 0 && `✓ Найдены данные за ${yearKeys.length} лет: ${yearKeys.join(", ")}`}
+                  {found && yearKeys.length === 0 && (found as Record<string,unknown>).rows && "✓ Найден формат rows — готово к применению"}
+                  {found && yearKeys.length === 0 && !(found as Record<string,unknown>).rows && `⚠ JSON найден, но годы не обнаружены (ключи: ${Object.keys(found).join(", ")})`}
+                </div>
+              );
+            })()}
             <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-200 justify-end">
               <span className="text-xs text-gray-400 flex-1">
                 {pasteText.length > 0 ? `${pasteText.length} символов` : ""}
