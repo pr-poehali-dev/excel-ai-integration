@@ -689,11 +689,10 @@ function loadPrompts(): PromptPreset[] {
     const s = localStorage.getItem("datamind_prompts");
     if (s) {
       const saved = JSON.parse(s) as PromptPreset[];
-      // Мержим сохранённые с дефолтными (на случай новых промптов)
-      return DEFAULT_PROMPTS.map(def => {
-        const found = saved.find(p => p.id === def.id);
-        return found ? { ...def, enabled: found.enabled, text: found.text } : def;
-      });
+      // Берём сохранённые как основу, добавляем дефолтные только если их id ещё нет
+      const savedIds = new Set(saved.map(p => p.id));
+      const newDefaults = DEFAULT_PROMPTS.filter(def => !savedIds.has(def.id));
+      return [...saved, ...newDefaults];
     }
   } catch (e) { void e; }
   return DEFAULT_PROMPTS;
