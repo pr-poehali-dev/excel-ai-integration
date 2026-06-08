@@ -489,8 +489,11 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
       if (chain.length > 0) lines.push(`  ${colLetter(c)}(col=${c}) = "${chain.join(" / ")}"`);
     }
 
-    lines.push(`ДАННЫЕ (формат: "Excel_строка(row=индекс_0based)\\tA\\tB\\tC...")`);
-    lines.push(`ВАЖНО: для cell_styles/cell_updates используй row=индекс из скобок, col=из ЦЕПОЧЕК ЗАГОЛОВКОВ`);
+    lines.push(`ДАННЫЕ (формат: "Excel_строка(row=индекс_0based)\\tcol0\\tcol1\\tcol2...")`);
+    lines.push(`ВАЖНО: позиция TAB-поля = номер col (0-based). Первое поле — метка строки, НЕ считается.`);
+    // Строка-шапка col-индексов — чтобы ИИ точно знал какое поле = какой col
+    const colIndexRow = "col→\t" + Array.from({ length: maxCols }, (_, c) => `col${c}`).join("\t");
+    lines.push(colIndexRow);
     let written = 0;
     for (let r = lastHR + 1; r < sh.cells.length && written < maxDataRows; r++) {
       const row = sh.cells[r];
@@ -969,12 +972,16 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 ШАГ 5. row и col — всегда 0-based. Строка Excel 1 = row 0. Столбец A = col 0, J = col 9, N = col 13.
 
 КАК ЧИТАТЬ TSV-ФОРМАТ (большие таблицы):
-- Строка "СТОЛБЦЫ:" — буква и номер каждого столбца: A=col0, B=col1, ...
-- Строки "ЗАГОЛОВКИ:" — несколько строк, объединённые ячейки раскрыты (значение повторяется)
-- Строки "ЦЕПОЧКИ ЗАГОЛОВКОВ:" — итоговый путь каждого столбца: J(col=9) = "2023 / Проект"
-- Строки "ДАННЫЕ:" — первая колонка = номер строки Excel, остальные = значения столбцов A, B, C...
-  Пример строки данных: "28\tДействующий фонд\t\t224\t\t263\t\t282\t\t316"
-  Здесь строка Excel 28, значение в col=9 (J) = 316 — это "2023 / Проект"
+- Строка "СТОЛБЦЫ:" — буква и номер каждого столбца: A=col0, B=col1, C=col2, D=col3, E=col4, F=col5, G=col6...
+- Строки "ЗАГОЛОВКИ:" — несколько строк, объединённые ячейки раскрыты (значение повторяется во всех столбцах диапазона)
+- Строки "ЦЕПОЧКИ ЗАГОЛОВКОВ:" — итоговый путь каждого столбца: F(col=5) = "2021 / Проект", G(col=6) = "2021 / Факт"
+- Строки "ДАННЫЕ:" — ПЕРВОЕ поле = "ExcelRow(row=индекс)", затем значения через TAB строго по порядку col=0, col=1, col=2...
+  Пример строки данных: "9(row=8)\t1\tДобыча нефти всего\tтыс.т\t\t3625.2\t2838.7\t..."
+  Здесь: col=0→"1", col=1→"Добыча нефти всего", col=2→"тыс.т", col=3→"", col=4→"", col=5→3625.2, col=6→2838.7
+  col=5 по ЦЕПОЧКАМ = "2021 / Проект" → значение 3625.2; col=6 = "2021 / Факт" → 2838.7
+
+ВАЖНО ПРИ ЧТЕНИИ TSV: позиция таба (0,1,2,3...) = col в cell_styles/cell_updates.
+Первое поле "9(row=8)" — не считается, это метка строки. Следующее поле = col=0, потом col=1, col=2...
 
 ━━━ КРИТИЧЕСКИЕ ПРАВИЛА ━━━
 - ВСЕГДА используй "ЦЕПОЧКИ ЗАГОЛОВКОВ" чтобы найти нужный столбец. Никогда не угадывай букву.
@@ -2174,12 +2181,21 @@ export default function Index() {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const s: Record<string, any> = { ...(cell.s ?? {}) };
               if (bgColor) {
-                s.fgColor = { argb: bgColor };
+                // Нормализуем до 8-символьного AARRGGBB
+                const rawBg = bgColor.replace(/^#/, "");
+                const argbBg = rawBg.length === 8 ? rawBg
+                  : rawBg.length === 6 ? `FF${rawBg}`
+                  : rawBg.length === 4 ? `FF${rawBg[1]}${rawBg[1]}${rawBg[2]}${rawBg[2]}${rawBg[3]}${rawBg[3]}`
+                  : rawBg.length === 3 ? `FF${rawBg[0]}${rawBg[0]}${rawBg[1]}${rawBg[1]}${rawBg[2]}${rawBg[2]}`
+                  : "FFFFFF00";
+                s.fgColor = { argb: argbBg };
                 s.patType = "solid";
-                s.fill = { type: "pattern", patternType: "solid", fgColor: { argb: bgColor } };
+                s.fill = { type: "pattern", patternType: "solid", fgColor: { argb: argbBg } };
               }
               if (fontColor) {
-                s.font = { ...(s.font ?? {}), color: { argb: fontColor } };
+                const rawFc = fontColor.replace(/^#/, "");
+                const argbFc = rawFc.length === 8 ? rawFc : rawFc.length === 6 ? `FF${rawFc}` : `FF${rawFc}`;
+                s.font = { ...(s.font ?? {}), color: { argb: argbFc } };
               }
               if (bold !== undefined) {
                 s.font = { ...(s.font ?? {}), bold };
@@ -2205,12 +2221,22 @@ export default function Index() {
               const prev = cells[resolvedRow][col] ?? { v: null };
               const newStyle: CellStyle = { ...(prev.s ?? {}) };
               if (bgColor) {
-                // Поддерживаем форматы: AARRGGBB (8 символов) и RRGGBB (6 символов)
-                const hex = bgColor.length === 8 ? bgColor.slice(2) : bgColor.length === 6 ? bgColor : bgColor.replace(/^#/, "");
+                const raw = bgColor.replace(/^#/, "");
+                // AARRGGBB (8) → берём RRGGBB; RRGGBB (6) → как есть; 4 → дублируем до 6; короче — fallback жёлтый
+                const hex = raw.length === 8 ? raw.slice(2)
+                  : raw.length === 6 ? raw
+                  : raw.length === 4 ? raw[1] + raw[1] + raw[2] + raw[2] + raw[3] + raw[3]
+                  : raw.length === 3 ? raw[0] + raw[0] + raw[1] + raw[1] + raw[2] + raw[2]
+                  : "FFFF00";
                 newStyle.bgColor = `#${hex}`;
               }
               if (fontColor) {
-                const hex = fontColor.length === 8 ? fontColor.slice(2) : fontColor.length === 6 ? fontColor : fontColor.replace(/^#/, "");
+                const raw = fontColor.replace(/^#/, "");
+                const hex = raw.length === 8 ? raw.slice(2)
+                  : raw.length === 6 ? raw
+                  : raw.length === 4 ? raw[1] + raw[1] + raw[2] + raw[2] + raw[3] + raw[3]
+                  : raw.length === 3 ? raw[0] + raw[0] + raw[1] + raw[1] + raw[2] + raw[2]
+                  : "000000";
                 newStyle.color = `#${hex}`;
               }
               if (bold !== undefined) newStyle.bold = bold;
