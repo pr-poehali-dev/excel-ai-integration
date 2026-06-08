@@ -15,14 +15,7 @@ import {
 } from "@/types/oilfield";
 import func2url from "../../backend/func2url.json";
 
-interface AiSettings { apiKey: string; baseUrl: string; model: string; customModel: string; }
-function loadAiSettings(): AiSettings {
-  try {
-    const s = localStorage.getItem("datamind_ai_settings");
-    if (s) return { baseUrl: "https://routerai.ru/api/v1", model: "deepseek/deepseek-chat", customModel: "", ...JSON.parse(s) };
-  } catch { /* */ }
-  return { apiKey: "", baseUrl: "https://routerai.ru/api/v1", model: "deepseek/deepseek-chat", customModel: "" };
-}
+
 
 const EXPORT_URL = (func2url as Record<string, string>)["export-xlsx"] ?? "";
 
@@ -103,7 +96,6 @@ export default function Oilfield() {
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
-  const [aiAnalyzing, setAiAnalyzing] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
@@ -189,30 +181,39 @@ export default function Oilfield() {
     }
   };
 
-  // Парсит любой JSON/текст от ИИ и вытаскивает значения % по показателям и годам
+  // Извлекает первый валидный JSON-объект из произвольного текста
+  const extractJsonFromText = (text: string): Record<string, unknown> | null => {
+    // Ищем все позиции открывающих скобок
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] !== '{') continue;
+      // Пробуем разобрать начиная с этой позиции — берём всё до конца и режем если не парсится
+      let depth = 0;
+      for (let j = i; j < text.length; j++) {
+        if (text[j] === '{') depth++;
+        else if (text[j] === '}') { depth--; }
+        if (depth === 0) {
+          const candidate = text.slice(i, j + 1);
+          try {
+            const obj = JSON.parse(candidate) as Record<string, unknown>;
+            // Проверяем что это содержательный объект (есть вложенные годы или rows)
+            const keys = Object.keys(obj);
+            if (keys.some(k => /^\d{4}$/.test(k)) || obj.rows || obj.analysis) return obj;
+          } catch { /* продолжаем */ }
+          break;
+        }
+      }
+    }
+    return null;
+  };
+
+  // Применяет данные из ответа ИИ к таблице
   const applyAiJson = (raw: string, currentField: typeof fields[0], currentIdx: number) => {
     type AnyObj = Record<string, unknown>;
 
-    // Вытаскиваем JSON из тега <analysis>...</analysis> или просто первый {...}
-    let jsonStr: string | null = null;
-    const tagMatch = raw.match(/<analysis>([\s\S]*?)<\/analysis>/i);
-    if (tagMatch) {
-      const inner = tagMatch[1].trim();
-      // Внутри тега может быть чистый JSON или JSON обёрнутый в ```
-      const codeMatch = inner.match(/```(?:json)?\s*([\s\S]*?)```/i);
-      jsonStr = codeMatch ? codeMatch[1].trim() : inner;
-    } else {
-      // Берём последний (самый большой) JSON-блок в тексте
-      const allMatches = [...raw.matchAll(/\{[\s\S]*?\}/g)];
-      // Ищем блок где есть годы типа "2021"
-      const yearBlock = allMatches.reverse().find(m => /"\d{4}"/.test(m[0]));
-      jsonStr = yearBlock ? yearBlock[0] : (raw.match(/\{[\s\S]*\}/)?.[0] ?? null);
-    }
+    const parsed = extractJsonFromText(raw);
+    if (!parsed) throw new Error("Не найден JSON с данными в тексте");
 
-    if (!jsonStr) throw new Error("ИИ не вернул JSON в ответе");
-
-    let parsed: AnyObj;
-    try { parsed = JSON.parse(jsonStr) as AnyObj; } catch { throw new Error("Не удалось разобрать JSON от ИИ"); }
+    console.log("[APPLY AI] keys:", Object.keys(parsed));
 
     // Формат 1: { rows: [{indicator, values}] }
     if (parsed.rows && Array.isArray(parsed.rows)) {
@@ -235,112 +236,56 @@ export default function Oilfield() {
     // Формат 2: { analysis: { "2021": {...} } } или { "2021": {...} }
     const analysisRoot = (parsed.analysis ?? parsed) as Record<string, unknown>;
     const yearKeys = Object.keys(analysisRoot).filter(k => /^\d{4}$/.test(k)).sort();
-    if (yearKeys.length === 0) throw new Error(`Не найдены годы в JSON от ИИ (ключи: ${Object.keys(parsed).join(", ")})`);
+    if (yearKeys.length === 0) throw new Error(`Годы не найдены. Ключи в JSON: ${Object.keys(parsed).join(", ")}`);
 
     const aiYears = yearKeys.map(Number);
     const analysis = analysisRoot as Record<string, Record<string, AnyObj>>;
 
-    // Все возможные названия поля с % отклонением (регистронезависимо)
-    const PCT_FIELDS = ["откл%", "откл_%", "отклонение_%", "отклонение%", "процент", "percent", "pct", "delta_%", "delta%", "%"];
+    const PCT_FIELDS = ["откл%", "откл_%", "отклонение_%", "отклонение%", "процент", "percent", "pct", "delta_%", "delta%"];
 
     const extractPct = (cell: AnyObj): number | null => {
-      // Ищем по известным именам
       for (const key of Object.keys(cell)) {
         if (PCT_FIELDS.includes(key.toLowerCase())) {
           const v = Number(cell[key]);
           if (!isNaN(v)) return Math.round(v * 10) / 10;
         }
       }
-      // Берём первое числовое поле (обычно это и есть отклонение)
+      // Берём первое числовое поле — обычно это и есть отклонение
       for (const key of Object.keys(cell)) {
-        const v = Number(cell[key]);
-        if (!isNaN(v) && typeof cell[key] === "number") return Math.round(v * 10) / 10;
+        if (typeof cell[key] === "number") return Math.round((cell[key] as number) * 10) / 10;
       }
       return null;
     };
 
+    let filledCount = 0;
     const updatedRows = currentField.chart1Rows.map((origRow) => {
+      const origLow = origRow.indicator.toLowerCase();
       const values = aiYears.map((yr, yi) => {
         const yearData = analysis[String(yr)];
         if (!yearData) return origRow.values[yi] ?? null;
 
-        // Ищем показатель: сначала точное совпадение, потом частичное (первые 8 символов)
-        const origLow = origRow.indicator.toLowerCase();
         const indicatorKey =
           Object.keys(yearData).find(k => k.toLowerCase() === origLow) ??
-          Object.keys(yearData).find(k =>
-            k.toLowerCase().includes(origLow.slice(0, 8)) ||
-            origLow.includes(k.toLowerCase().slice(0, 8))
-          );
-        if (!indicatorKey) return origRow.values[yi] ?? null;
+          Object.keys(yearData).find(k => k.toLowerCase().includes(origLow.slice(0, 6))) ??
+          Object.keys(yearData).find(k => origLow.includes(k.toLowerCase().slice(0, 6)));
 
-        return extractPct(yearData[indicatorKey] as AnyObj) ?? (origRow.values[yi] ?? null);
+        if (!indicatorKey) return origRow.values[yi] ?? null;
+        const pct = extractPct(yearData[indicatorKey] as AnyObj);
+        if (pct !== null) filledCount++;
+        return pct ?? (origRow.values[yi] ?? null);
       });
       return { ...origRow, values };
     });
+
+    console.log("[APPLY AI] filled cells:", filledCount, "years:", aiYears);
+    if (filledCount === 0) throw new Error("JSON найден, но не удалось извлечь числовые отклонения. Убедись что в ответе ИИ есть блок с годами и процентами.");
 
     setFields(prev => prev.map((f, i) =>
       i === currentIdx ? { ...f, years: aiYears, chart1Rows: updatedRows } : f
     ));
   };
 
-  const runAiAnalysis = async () => {
-    const settings = loadAiSettings();
-    if (!settings.apiKey) {
-      setAiError("Нет API ключа — настрой его в главном приложении (шестерёнка)");
-      return;
-    }
-    const currentField = fields[selectedIdx];
-    const currentIdx = selectedIdx;
 
-    setAiAnalyzing(true);
-    setAiError(null);
-    try {
-      const model = settings.model === "__custom__" ? settings.customModel : settings.model;
-
-      const yearsLine = ["Показатель", ...currentField.years.map(String)].join("\t");
-      const dataLines = currentField.chart1Rows.map(row =>
-        [row.indicator, ...row.values.map(v => v !== null ? String(v) : "")].join("\t")
-      );
-      const tableText = [yearsLine, ...dataLines].join("\n");
-
-      const systemPrompt = `Ты инструмент расчёта таблицы изменений показателей нефтедобычи.
-Получаешь текущую таблицу. Рассчитай отклонения (%) для каждого показателя по каждому году.
-Верни ТОЛЬКО JSON без пояснений в формате:
-{"rows": [{"indicator": "название", "values": [число, ...]}, ...]}
-Порядок показателей: ${currentField.chart1Rows.map((r, i) => `${i + 1}. ${r.indicator}`).join("; ")}
-Порядок лет: ${currentField.years.join(", ")}
-Каждый values — ровно ${currentField.years.length} чисел. Null если нет данных.`;
-
-      const resp = await fetch(`${settings.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.apiKey}` },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: `Таблица:\n${tableText}\n\nВерни JSON с полем rows.` },
-          ],
-          max_tokens: 3000,
-          temperature: 0,
-        }),
-      });
-      if (!resp.ok) {
-        const errBody = await resp.json().catch(() => ({})) as { error?: { message?: string } };
-        throw new Error(errBody.error?.message || `HTTP ${resp.status}`);
-      }
-      const json = await resp.json() as { choices: { message: { content: string } }[] };
-      const raw = json.choices?.[0]?.message?.content ?? "{}";
-      console.log("[OILFIELD AI RAW]", raw.slice(0, 2000));
-
-      applyAiJson(raw, currentField, currentIdx);
-    } catch (e) {
-      console.error("[OILFIELD AI ERROR]", e);
-      setAiError(e instanceof Error ? e.message : "Ошибка анализа");
-    } finally {
-      setAiAnalyzing(false);
-    }
-  };
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "#f5f5f5", fontFamily: "Calibri, Arial, sans-serif" }}>
@@ -383,26 +328,14 @@ export default function Oilfield() {
           </label>
 
           {activeTab === "chart1" && (
-            <>
-              <button
-                onClick={runAiAnalysis}
-                disabled={aiAnalyzing}
-                className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition disabled:opacity-50"
-                style={{ background: "rgba(52,211,153,0.15)", borderColor: "rgba(52,211,153,0.5)", color: "#34d399" }}
-              >
-                {aiAnalyzing
-                  ? <><Icon name="Loader2" size={13} className="spinner" />Анализирую...</>
-                  : <><Icon name="Sparkles" size={13} />ИИ-анализ</>}
-              </button>
-              <button
-                onClick={() => { setPasteText(""); setPasteOpen(true); }}
-                className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition"
-                style={{ background: "rgba(99,179,237,0.15)", borderColor: "rgba(99,179,237,0.5)", color: "#90cdf4" }}
-              >
-                <Icon name="ClipboardPaste" size={13} />
-                Вставить из ИИ
-              </button>
-            </>
+            <button
+              onClick={() => { setPasteText(""); setPasteOpen(true); }}
+              className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition"
+              style={{ background: "rgba(52,211,153,0.2)", borderColor: "rgba(52,211,153,0.6)", color: "#34d399" }}
+            >
+              <Icon name="Sparkles" size={13} />
+              Применить анализ ИИ
+            </button>
           )}
 
           <button
@@ -632,14 +565,15 @@ export default function Oilfield() {
                 <Icon name="X" size={16} />
               </button>
             </div>
-            <div className="px-4 py-2 text-xs text-gray-500 border-b border-gray-100">
-              Скопируй полный ответ ИИ из чата DataMind и вставь сюда (Ctrl+V)
+            <div className="px-4 py-2.5 text-xs border-b border-gray-100" style={{ background: "#f0f7f0", color: "#1b5e20" }}>
+              <b>Как использовать:</b> в чате DataMind попроси ИИ проанализировать таблицу проект/факт →
+              выдели весь ответ ИИ (Ctrl+A в поле чата) → скопируй (Ctrl+C) → вставь сюда (Ctrl+V) → нажми «Применить»
             </div>
             <textarea
               autoFocus
               className="flex-1 p-4 text-xs font-mono resize-none outline-none text-gray-700"
-              style={{ minHeight: 300 }}
-              placeholder='Вставь сюда весь текст ответа ИИ — программа сама найдёт данные...'
+              style={{ minHeight: 280 }}
+              placeholder={"Вставь сюда полный текст ответа ИИ...\n\nПрограмма автоматически найдёт в нём годы и процентные отклонения по каждому показателю и обновит таблицу."}
               value={pasteText}
               onChange={e => setPasteText(e.target.value)}
             />
