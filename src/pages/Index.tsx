@@ -374,7 +374,11 @@ function cellAddr(row: number, col: number): string {
 function getRealColCount(sh: SheetData): number {
   let maxC = 0;
   sh.cells.forEach(row => {
-    row.forEach((c, ci) => { if (c.v !== null) maxC = Math.max(maxC, ci + 1); });
+    row.forEach((cell, ci) => {
+      const hasVal = cell.v !== null && cell.v !== undefined;
+      const hasW = cell.w && cell.w.trim();
+      if (hasVal || hasW) maxC = Math.max(maxC, ci + 1);
+    });
   });
   sh.merges.forEach(m => { maxC = Math.max(maxC, m.c2 + 1); });
   return Math.min(maxC + 1, 60);
@@ -401,26 +405,37 @@ function getMergeOwner(sh: SheetData, r: number, c: number): { r: number; c: num
 function detectLastHeaderRow(sh: SheetData): number {
   const maxC = getRealColCount(sh);
   const FULL_ROW_THRESHOLD = 0.8; // объединение шириной ≥ 80% = строка-разделитель, не заголовок
+  // Заголовки не могут занимать больше 20 строк — ограничиваем поиск
+  const MAX_HEADER_ROWS = 20;
 
-  let lastHeaderMergeRow = -1;
-  for (const m of sh.merges) {
-    const spanCols = m.c2 - m.c1 + 1;
-    if (spanCols / maxC >= FULL_ROW_THRESHOLD) continue; // строка-разделитель — пропускаем
-    lastHeaderMergeRow = Math.max(lastHeaderMergeRow, m.r2);
-  }
-  if (lastHeaderMergeRow >= 0) return lastHeaderMergeRow;
-
-  // Fallback: первая строка где >50% непустых ячеек числовые
-  for (let r = 0; r < Math.min(sh.cells.length, 30); r++) {
+  // Способ 1: ищем первую строку данных (>50% числовых значений) — заголовок заканчивается перед ней
+  for (let r = 0; r < Math.min(sh.cells.length, 40); r++) {
     const row = sh.cells[r];
     if (!row) continue;
     let nums = 0, total = 0;
     for (let c = 0; c < maxC; c++) {
       const v = row[c]?.v;
-      if (v !== null && v !== undefined && v !== "") { total++; if (typeof v === "number") nums++; }
+      if (v !== null && v !== undefined && v !== "") {
+        total++;
+        if (typeof v === "number") nums++;
+      }
     }
-    if (total > 2 && nums / total > 0.5) return r - 1;
+    if (total > 3 && nums / total > 0.5) {
+      // Нашли первую строку данных — заголовок заканчивается на строке выше
+      return r - 1;
+    }
   }
+
+  // Способ 2: последнее объединение строго в пределах MAX_HEADER_ROWS, не-полное (не разделитель)
+  let lastHeaderMergeRow = -1;
+  for (const m of sh.merges) {
+    if (m.r1 >= MAX_HEADER_ROWS) continue; // объединение за пределами зоны заголовков — пропускаем
+    const spanCols = m.c2 - m.c1 + 1;
+    if (spanCols / maxC >= FULL_ROW_THRESHOLD) continue; // строка-разделитель — пропускаем
+    lastHeaderMergeRow = Math.max(lastHeaderMergeRow, Math.min(m.r2, MAX_HEADER_ROWS - 1));
+  }
+  if (lastHeaderMergeRow >= 0) return lastHeaderMergeRow;
+
   return 2;
 }
 
@@ -456,6 +471,7 @@ function buildSheetContext(sh: SheetData, maxDataRows = 250): string {
   if (totalDataRows > COMPACT_THRESHOLD) {
     const lines: string[] = [];
     const lastHR = detectLastHeaderRow(sh);
+    console.log(`[SHEET] "${sh.name}" totalRows=${totalDataRows} maxCols=${maxCols} lastHR=${lastHR} dataFrom=${lastHR + 2}`);
 
     // Строим карту: для каждой ячейки заголовка — реальное значение с учётом объединений
     // Объединённые ячейки: значение владельца копируется во все дочерние ячейки
