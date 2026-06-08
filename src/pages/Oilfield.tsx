@@ -187,13 +187,75 @@ export default function Oilfield() {
     }
   };
 
+  // Парсит любой JSON от ИИ и вытаскивает значения % по показателям и годам
+  const applyAiJson = (raw: string, currentField: typeof fields[0], currentIdx: number) => {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error("ИИ не вернул JSON в ответе");
+
+    type AnyObj = Record<string, unknown>;
+    let parsed: AnyObj;
+    try { parsed = JSON.parse(jsonMatch[0]) as AnyObj; } catch { throw new Error("Не удалось разобрать JSON от ИИ"); }
+
+    // Формат 1: { rows: [{indicator, values}] }
+    if (parsed.rows && Array.isArray(parsed.rows)) {
+      const rows = parsed.rows as { indicator: string; values: (number | null)[] }[];
+      const updatedRows = currentField.chart1Rows.map((origRow, i) => {
+        const aiRow = rows.find(r => r.indicator === origRow.indicator) ?? rows[i];
+        if (!aiRow) return origRow;
+        const values = currentField.years.map((_, yi) => {
+          const v = aiRow.values[yi];
+          if (v === null || v === undefined) return origRow.values[yi];
+          const num = Number(v);
+          return isNaN(num) ? origRow.values[yi] : num;
+        });
+        return { ...origRow, values };
+      });
+      setFields(prev => prev.map((f, i) => i === currentIdx ? { ...f, chart1Rows: updatedRows } : f));
+      return;
+    }
+
+    // Формат 2 (стандартный ответ DataMind): { analysis: { "2021": { "Добыча нефти": { "Процент": X } } } }
+    const analysis = (parsed.analysis ?? parsed) as Record<string, Record<string, AnyObj>>;
+    const yearKeys = Object.keys(analysis).filter(k => /^\d{4}$/.test(k)).sort();
+    if (yearKeys.length === 0) throw new Error(`Неизвестный формат ответа ИИ (ключи: ${Object.keys(parsed).join(", ")})`);
+
+    // Обновляем годы в таблице если ИИ вернул другой набор лет
+    const aiYears = yearKeys.map(Number);
+
+    const updatedRows = currentField.chart1Rows.map((origRow) => {
+      const values = aiYears.map((yr, yi) => {
+        const yearData = analysis[String(yr)];
+        if (!yearData) return origRow.values[yi] ?? null;
+
+        // Ищем показатель по частичному совпадению названия (ИИ иногда чуть меняет формулировку)
+        const indicatorKey = Object.keys(yearData).find(k =>
+          k.toLowerCase().includes(origRow.indicator.toLowerCase().slice(0, 10)) ||
+          origRow.indicator.toLowerCase().includes(k.toLowerCase().slice(0, 10))
+        );
+        if (!indicatorKey) return origRow.values[yi] ?? null;
+
+        const cell = yearData[indicatorKey] as AnyObj;
+        // Берём поле "откл_%" / "Процент" / "percent" / первое числовое поле
+        const pct = cell["откл_%"] ?? cell["Процент"] ?? cell["percent"] ?? cell["отклонение_%"] ?? null;
+        if (pct === null || pct === undefined) return origRow.values[yi] ?? null;
+        const num = Number(pct);
+        return isNaN(num) ? (origRow.values[yi] ?? null) : Math.round(num * 10) / 10;
+      });
+      return { ...origRow, values };
+    });
+
+    // Если годы от ИИ отличаются — обновляем и годы тоже
+    setFields(prev => prev.map((f, i) =>
+      i === currentIdx ? { ...f, years: aiYears, chart1Rows: updatedRows } : f
+    ));
+  };
+
   const runAiAnalysis = async () => {
     const settings = loadAiSettings();
     if (!settings.apiKey) {
       setAiError("Нет API ключа — настрой его в главном приложении (шестерёнка)");
       return;
     }
-    // Захватываем текущий срез данных ДО async — не будет устаревших замыканий
     const currentField = fields[selectedIdx];
     const currentIdx = selectedIdx;
 
@@ -208,32 +270,23 @@ export default function Oilfield() {
       );
       const tableText = [yearsLine, ...dataLines].join("\n");
 
-      // Строим явный маппинг: название показателя chart1 → индекс года
-      const indicatorNames = currentField.chart1Rows.map(r => r.indicator);
-
-      const systemPrompt = `Ты инструмент обновления таблицы. Получаешь таблицу изменений показателей нефтедобычи по годам (%).
-ЗАДАЧА: на основе анализа данных заполнить или скорректировать значения таблицы.
-ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТВЕТА — строго JSON без markdown, без пояснений:
-{
-  "rows": [
-    {"indicator": "точное_название_показателя", "values": [число, число, ...]},
-    ...
-  ]
-}
-Показатели (в точном порядке): ${indicatorNames.map((n, i) => `${i + 1}. ${n}`).join(", ")}
-Годы (в точном порядке): ${currentField.years.join(", ")}
-Количество строк в rows ДОЛЖНО быть ${currentField.chart1Rows.length}.
-Количество значений в каждом values ДОЛЖНО быть ${currentField.years.length}.
-Если значение неизвестно — пиши null. Никаких других полей кроме rows не добавляй.`;
-
-      const userPrompt = `Месторождение: ${currentField.name}\n\nТекущая таблица:\n${tableText}\n\nЗаполни/скорректируй значения и верни JSON.`;
+      const systemPrompt = `Ты инструмент расчёта таблицы изменений показателей нефтедобычи.
+Получаешь текущую таблицу. Рассчитай отклонения (%) для каждого показателя по каждому году.
+Верни ТОЛЬКО JSON без пояснений в формате:
+{"rows": [{"indicator": "название", "values": [число, ...]}, ...]}
+Порядок показателей: ${currentField.chart1Rows.map((r, i) => `${i + 1}. ${r.indicator}`).join("; ")}
+Порядок лет: ${currentField.years.join(", ")}
+Каждый values — ровно ${currentField.years.length} чисел. Null если нет данных.`;
 
       const resp = await fetch(`${settings.baseUrl}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.apiKey}` },
         body: JSON.stringify({
           model,
-          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: `Таблица:\n${tableText}\n\nВерни JSON с полем rows.` },
+          ],
           max_tokens: 3000,
           temperature: 0,
         }),
@@ -246,32 +299,7 @@ export default function Oilfield() {
       const raw = json.choices?.[0]?.message?.content ?? "{}";
       console.log("[OILFIELD AI RAW]", raw.slice(0, 2000));
 
-      // Вырезаем JSON даже если модель обернула его в ```json
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error("ИИ не вернул JSON в ответе");
-
-      type AiParsed = { rows?: { indicator: string; values: (number | null)[] }[] };
-      let parsed: AiParsed;
-      try { parsed = JSON.parse(jsonMatch[0]) as AiParsed; } catch { throw new Error("Не удалось разобрать JSON от ИИ"); }
-
-      if (!parsed.rows || !Array.isArray(parsed.rows) || parsed.rows.length === 0) {
-        throw new Error(`ИИ вернул неверный формат — нет поля rows (получили: ${Object.keys(parsed).join(", ")})`);
-      }
-
-      const updatedRows = currentField.chart1Rows.map((origRow, i) => {
-        // Ищем по точному названию, потом по индексу
-        const aiRow = parsed.rows!.find(r => r.indicator === origRow.indicator) ?? parsed.rows![i];
-        if (!aiRow) return origRow;
-        const values = currentField.years.map((_, yi) => {
-          const v = aiRow.values[yi];
-          if (v === null || v === undefined) return origRow.values[yi];
-          const num = Number(v);
-          return isNaN(num) ? origRow.values[yi] : num;
-        });
-        return { ...origRow, values };
-      });
-
-      setFields(prev => prev.map((f, i) => i === currentIdx ? { ...f, chart1Rows: updatedRows } : f));
+      applyAiJson(raw, currentField, currentIdx);
     } catch (e) {
       console.error("[OILFIELD AI ERROR]", e);
       setAiError(e instanceof Error ? e.message : "Ошибка анализа");
@@ -321,16 +349,36 @@ export default function Oilfield() {
           </label>
 
           {activeTab === "chart1" && (
-            <button
-              onClick={runAiAnalysis}
-              disabled={aiAnalyzing}
-              className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition disabled:opacity-50"
-              style={{ background: "rgba(52,211,153,0.15)", borderColor: "rgba(52,211,153,0.5)", color: "#34d399" }}
-            >
-              {aiAnalyzing
-                ? <><Icon name="Loader2" size={13} className="spinner" />Анализирую...</>
-                : <><Icon name="Sparkles" size={13} />ИИ-анализ</>}
-            </button>
+            <>
+              <button
+                onClick={runAiAnalysis}
+                disabled={aiAnalyzing}
+                className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition disabled:opacity-50"
+                style={{ background: "rgba(52,211,153,0.15)", borderColor: "rgba(52,211,153,0.5)", color: "#34d399" }}
+              >
+                {aiAnalyzing
+                  ? <><Icon name="Loader2" size={13} className="spinner" />Анализирую...</>
+                  : <><Icon name="Sparkles" size={13} />ИИ-анализ</>}
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    const text = await navigator.clipboard.readText();
+                    const currentField = fields[selectedIdx];
+                    applyAiJson(text, currentField, selectedIdx);
+                    setAiError(null);
+                  } catch {
+                    setAiError("Не удалось прочитать буфер обмена — скопируй JSON из чата и попробуй снова");
+                  }
+                }}
+                className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition"
+                style={{ background: "rgba(99,179,237,0.15)", borderColor: "rgba(99,179,237,0.5)", color: "#90cdf4" }}
+                title="Скопируй JSON из ответа ИИ в DataMind и нажми эту кнопку"
+              >
+                <Icon name="ClipboardPaste" size={13} />
+                Вставить из ИИ
+              </button>
+            </>
           )}
 
           <button
