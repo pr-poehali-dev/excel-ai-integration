@@ -105,6 +105,8 @@ export default function Oilfield() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [aiAnalyzing, setAiAnalyzing] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
 
   const selected = fields[selectedIdx];
 
@@ -393,19 +395,9 @@ export default function Oilfield() {
                   : <><Icon name="Sparkles" size={13} />ИИ-анализ</>}
               </button>
               <button
-                onClick={async () => {
-                  try {
-                    const text = await navigator.clipboard.readText();
-                    const currentField = fields[selectedIdx];
-                    applyAiJson(text, currentField, selectedIdx);
-                    setAiError(null);
-                  } catch {
-                    setAiError("Не удалось прочитать буфер обмена — скопируй JSON из чата и попробуй снова");
-                  }
-                }}
+                onClick={() => { setPasteText(""); setPasteOpen(true); }}
                 className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition"
                 style={{ background: "rgba(99,179,237,0.15)", borderColor: "rgba(99,179,237,0.5)", color: "#90cdf4" }}
-                title="Скопируй JSON из ответа ИИ в DataMind и нажми эту кнопку"
               >
                 <Icon name="ClipboardPaste" size={13} />
                 Вставить из ИИ
@@ -622,6 +614,66 @@ export default function Oilfield() {
           </div>
         </div>
       </div>
+
+      {/* Модалка вставки ответа ИИ */}
+      {pasteOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          style={{ background: "rgba(0,0,0,0.5)" }}
+          onClick={(e) => { if (e.target === e.currentTarget) setPasteOpen(false); }}
+        >
+          <div className="bg-white rounded-lg shadow-xl flex flex-col" style={{ width: 560, maxHeight: "80vh" }}>
+            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200">
+              <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
+                <Icon name="ClipboardPaste" size={15} />
+                Вставить ответ ИИ
+              </div>
+              <button onClick={() => setPasteOpen(false)} className="text-gray-400 hover:text-gray-600">
+                <Icon name="X" size={16} />
+              </button>
+            </div>
+            <div className="px-4 py-2 text-xs text-gray-500 border-b border-gray-100">
+              Скопируй полный ответ ИИ из чата DataMind и вставь сюда (Ctrl+V)
+            </div>
+            <textarea
+              autoFocus
+              className="flex-1 p-4 text-xs font-mono resize-none outline-none text-gray-700"
+              style={{ minHeight: 300 }}
+              placeholder='Вставь сюда весь текст ответа ИИ — программа сама найдёт данные...'
+              value={pasteText}
+              onChange={e => setPasteText(e.target.value)}
+            />
+            <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-200 justify-end">
+              <span className="text-xs text-gray-400 flex-1">
+                {pasteText.length > 0 ? `${pasteText.length} символов` : ""}
+              </span>
+              <button
+                onClick={() => setPasteOpen(false)}
+                className="px-4 py-1.5 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+              >
+                Отмена
+              </button>
+              <button
+                disabled={pasteText.trim().length === 0}
+                onClick={() => {
+                  try {
+                    applyAiJson(pasteText, fields[selectedIdx], selectedIdx);
+                    setAiError(null);
+                    setPasteOpen(false);
+                  } catch (e) {
+                    setAiError(e instanceof Error ? e.message : "Ошибка разбора");
+                    setPasteOpen(false);
+                  }
+                }}
+                className="px-4 py-1.5 text-xs rounded font-semibold disabled:opacity-40"
+                style={{ background: "#217346", color: "#fff" }}
+              >
+                Применить к таблице
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
