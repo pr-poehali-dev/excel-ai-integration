@@ -187,14 +187,30 @@ export default function Oilfield() {
     }
   };
 
-  // Парсит любой JSON от ИИ и вытаскивает значения % по показателям и годам
+  // Парсит любой JSON/текст от ИИ и вытаскивает значения % по показателям и годам
   const applyAiJson = (raw: string, currentField: typeof fields[0], currentIdx: number) => {
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("ИИ не вернул JSON в ответе");
-
     type AnyObj = Record<string, unknown>;
+
+    // Вытаскиваем JSON из тега <analysis>...</analysis> или просто первый {...}
+    let jsonStr: string | null = null;
+    const tagMatch = raw.match(/<analysis>([\s\S]*?)<\/analysis>/i);
+    if (tagMatch) {
+      const inner = tagMatch[1].trim();
+      // Внутри тега может быть чистый JSON или JSON обёрнутый в ```
+      const codeMatch = inner.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      jsonStr = codeMatch ? codeMatch[1].trim() : inner;
+    } else {
+      // Берём последний (самый большой) JSON-блок в тексте
+      const allMatches = [...raw.matchAll(/\{[\s\S]*?\}/g)];
+      // Ищем блок где есть годы типа "2021"
+      const yearBlock = allMatches.reverse().find(m => /"\d{4}"/.test(m[0]));
+      jsonStr = yearBlock ? yearBlock[0] : (raw.match(/\{[\s\S]*\}/)?.[0] ?? null);
+    }
+
+    if (!jsonStr) throw new Error("ИИ не вернул JSON в ответе");
+
     let parsed: AnyObj;
-    try { parsed = JSON.parse(jsonMatch[0]) as AnyObj; } catch { throw new Error("Не удалось разобрать JSON от ИИ"); }
+    try { parsed = JSON.parse(jsonStr) as AnyObj; } catch { throw new Error("Не удалось разобрать JSON от ИИ"); }
 
     // Формат 1: { rows: [{indicator, values}] }
     if (parsed.rows && Array.isArray(parsed.rows)) {
@@ -214,37 +230,53 @@ export default function Oilfield() {
       return;
     }
 
-    // Формат 2 (стандартный ответ DataMind): { analysis: { "2021": { "Добыча нефти": { "Процент": X } } } }
-    const analysis = (parsed.analysis ?? parsed) as Record<string, Record<string, AnyObj>>;
-    const yearKeys = Object.keys(analysis).filter(k => /^\d{4}$/.test(k)).sort();
-    if (yearKeys.length === 0) throw new Error(`Неизвестный формат ответа ИИ (ключи: ${Object.keys(parsed).join(", ")})`);
+    // Формат 2: { analysis: { "2021": {...} } } или { "2021": {...} }
+    const analysisRoot = (parsed.analysis ?? parsed) as Record<string, unknown>;
+    const yearKeys = Object.keys(analysisRoot).filter(k => /^\d{4}$/.test(k)).sort();
+    if (yearKeys.length === 0) throw new Error(`Не найдены годы в JSON от ИИ (ключи: ${Object.keys(parsed).join(", ")})`);
 
-    // Обновляем годы в таблице если ИИ вернул другой набор лет
     const aiYears = yearKeys.map(Number);
+    const analysis = analysisRoot as Record<string, Record<string, AnyObj>>;
+
+    // Все возможные названия поля с % отклонением (регистронезависимо)
+    const PCT_FIELDS = ["откл%", "откл_%", "отклонение_%", "отклонение%", "процент", "percent", "pct", "delta_%", "delta%", "%"];
+
+    const extractPct = (cell: AnyObj): number | null => {
+      // Ищем по известным именам
+      for (const key of Object.keys(cell)) {
+        if (PCT_FIELDS.includes(key.toLowerCase())) {
+          const v = Number(cell[key]);
+          if (!isNaN(v)) return Math.round(v * 10) / 10;
+        }
+      }
+      // Берём первое числовое поле (обычно это и есть отклонение)
+      for (const key of Object.keys(cell)) {
+        const v = Number(cell[key]);
+        if (!isNaN(v) && typeof cell[key] === "number") return Math.round(v * 10) / 10;
+      }
+      return null;
+    };
 
     const updatedRows = currentField.chart1Rows.map((origRow) => {
       const values = aiYears.map((yr, yi) => {
         const yearData = analysis[String(yr)];
         if (!yearData) return origRow.values[yi] ?? null;
 
-        // Ищем показатель по частичному совпадению названия (ИИ иногда чуть меняет формулировку)
-        const indicatorKey = Object.keys(yearData).find(k =>
-          k.toLowerCase().includes(origRow.indicator.toLowerCase().slice(0, 10)) ||
-          origRow.indicator.toLowerCase().includes(k.toLowerCase().slice(0, 10))
-        );
+        // Ищем показатель: сначала точное совпадение, потом частичное (первые 8 символов)
+        const origLow = origRow.indicator.toLowerCase();
+        const indicatorKey =
+          Object.keys(yearData).find(k => k.toLowerCase() === origLow) ??
+          Object.keys(yearData).find(k =>
+            k.toLowerCase().includes(origLow.slice(0, 8)) ||
+            origLow.includes(k.toLowerCase().slice(0, 8))
+          );
         if (!indicatorKey) return origRow.values[yi] ?? null;
 
-        const cell = yearData[indicatorKey] as AnyObj;
-        // Берём поле "откл_%" / "Процент" / "percent" / первое числовое поле
-        const pct = cell["откл_%"] ?? cell["Процент"] ?? cell["percent"] ?? cell["отклонение_%"] ?? null;
-        if (pct === null || pct === undefined) return origRow.values[yi] ?? null;
-        const num = Number(pct);
-        return isNaN(num) ? (origRow.values[yi] ?? null) : Math.round(num * 10) / 10;
+        return extractPct(yearData[indicatorKey] as AnyObj) ?? (origRow.values[yi] ?? null);
       });
       return { ...origRow, values };
     });
 
-    // Если годы от ИИ отличаются — обновляем и годы тоже
     setFields(prev => prev.map((f, i) =>
       i === currentIdx ? { ...f, years: aiYears, chart1Rows: updatedRows } : f
     ));
