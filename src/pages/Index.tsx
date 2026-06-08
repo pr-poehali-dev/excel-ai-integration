@@ -1673,6 +1673,11 @@ export default function Index() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [promptsOpen, setPromptsOpen] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [notes, setNotes] = useState<{id: string; title: string; text: string}[]>(() => {
+    try { return JSON.parse(localStorage.getItem("dm_notes") || "[]"); } catch { return []; }
+  });
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
   const navigate = useNavigate();
   const [aiSettings, setAiSettings] = useState<AiSettings>(loadSettings);
   const [, setAiError] = useState<string | null>(null);
@@ -2551,6 +2556,17 @@ export default function Index() {
             {prompts.some(p => p.enabled) && (
               <span className="w-4 h-4 rounded-full bg-primary text-[9px] text-primary-foreground flex items-center justify-center font-bold">
                 {prompts.filter(p => p.enabled).length}
+              </span>
+            )}
+          </button>
+          <button onClick={() => setNotesOpen(n => !n)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all border ${notesOpen ? "text-amber-300 border-amber-300/40 bg-amber-300/10" : "text-muted-foreground border-border/40 hover:text-foreground hover:bg-secondary"}`}
+            title="Заметки и шаблоны заданий">
+            <Icon name="StickyNote" size={14} />
+            <span className="hidden sm:inline">Заметки</span>
+            {notes.length > 0 && (
+              <span className="w-4 h-4 rounded-full bg-amber-400 text-[9px] text-black flex items-center justify-center font-bold">
+                {notes.length}
               </span>
             )}
           </button>
@@ -3609,6 +3625,135 @@ export default function Index() {
 
             <div className="px-5 py-3 border-t border-border/40 text-right">
               <button onClick={() => setSessionOpen(false)} className="px-4 py-1.5 rounded-lg text-xs btn-primary">Закрыть</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Notes Modal ── */}
+      {notesOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-16 px-4" style={{ background: "rgba(0,0,0,0.7)" }}
+          onClick={(e) => { if (e.target === e.currentTarget) { setNotesOpen(false); setEditingNoteId(null); } }}>
+          <div className="w-full max-w-2xl rounded-2xl border border-border/60 flex flex-col max-h-[80vh]"
+            style={{ background: "hsl(220,14%,8%)" }}>
+
+            {/* Шапка */}
+            <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3">
+              <Icon name="StickyNote" size={16} className="text-amber-400" />
+              <h2 className="font-semibold text-sm text-foreground flex-1">Заметки</h2>
+              <p className="text-xs text-muted-foreground">Шаблоны заданий для ИИ</p>
+              <button onClick={() => { setNotesOpen(false); setEditingNoteId(null); }}
+                className="text-muted-foreground hover:text-foreground transition-colors ml-2">
+                <Icon name="X" size={16} />
+              </button>
+            </div>
+
+            {/* Список заметок */}
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-2">
+              {notes.length === 0 && !editingNoteId && (
+                <p className="text-xs text-muted-foreground text-center py-8">Нет заметок. Добавь шаблон задания — сможешь копировать одним кликом.</p>
+              )}
+              {notes.map((note) => (
+                <div key={note.id} className={`rounded-xl border transition-all ${editingNoteId === note.id ? "border-amber-400/40 bg-amber-400/5" : "border-border/40 hover:border-border/60"}`}>
+                  {editingNoteId === note.id ? (
+                    <div className="p-3 flex flex-col gap-2">
+                      <input
+                        autoFocus
+                        defaultValue={note.title}
+                        placeholder="Название заметки"
+                        onBlur={(e) => {
+                          const updated = notes.map(n => n.id === note.id ? { ...n, title: e.target.value || n.title } : n);
+                          setNotes(updated);
+                          localStorage.setItem("dm_notes", JSON.stringify(updated));
+                        }}
+                        className="w-full text-xs font-semibold text-foreground bg-background/50 border border-amber-400/30 rounded px-2 py-1 outline-none focus:border-amber-400/60"
+                      />
+                      <textarea
+                        defaultValue={note.text}
+                        rows={6}
+                        placeholder="Текст задания..."
+                        onBlur={(e) => {
+                          const updated = notes.map(n => n.id === note.id ? { ...n, text: e.target.value } : n);
+                          setNotes(updated);
+                          localStorage.setItem("dm_notes", JSON.stringify(updated));
+                        }}
+                        className="w-full text-xs text-foreground bg-background/50 border border-amber-400/30 rounded-lg px-3 py-2 resize-y outline-none focus:border-amber-400/60 font-mono min-h-[80px] max-h-[300px]"
+                      />
+                      <div className="flex justify-end gap-2">
+                        <button onClick={() => setEditingNoteId(null)}
+                          className="px-3 py-1 rounded-lg text-xs btn-primary">
+                          Готово
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-start gap-3 p-3">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-foreground mb-1">{note.title}</p>
+                        <p className="text-[11px] text-muted-foreground leading-relaxed line-clamp-2 font-mono">{note.text}</p>
+                      </div>
+                      <div className="flex gap-1 flex-shrink-0">
+                        {/* Копировать в буфер */}
+                        <button
+                          onClick={() => { navigator.clipboard.writeText(note.text); }}
+                          className="text-muted-foreground hover:text-amber-400 transition-colors p-1"
+                          title="Скопировать текст">
+                          <Icon name="Copy" size={13} />
+                        </button>
+                        {/* Вставить в поле задания */}
+                        <button
+                          onClick={() => {
+                            setAiInput(note.text);
+                            setNotesOpen(false);
+                            setEditingNoteId(null);
+                          }}
+                          className="text-muted-foreground hover:text-primary transition-colors p-1"
+                          title="Вставить в поле задания">
+                          <Icon name="CornerDownLeft" size={13} />
+                        </button>
+                        {/* Редактировать */}
+                        <button onClick={() => setEditingNoteId(note.id)}
+                          className="text-muted-foreground hover:text-foreground transition-colors p-1"
+                          title="Редактировать">
+                          <Icon name="Pencil" size={13} />
+                        </button>
+                        {/* Удалить */}
+                        <button onClick={() => {
+                          if (!confirm(`Удалить заметку "${note.title}"?`)) return;
+                          const updated = notes.filter(n => n.id !== note.id);
+                          setNotes(updated);
+                          localStorage.setItem("dm_notes", JSON.stringify(updated));
+                          if (editingNoteId === note.id) setEditingNoteId(null);
+                        }} className="text-muted-foreground hover:text-red-400 transition-colors p-1" title="Удалить">
+                          <Icon name="Trash2" size={13} />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {/* Добавить заметку */}
+              <button onClick={() => {
+                const newNote = { id: crypto.randomUUID(), title: "Новая заметка", text: "" };
+                const updated = [...notes, newNote];
+                setNotes(updated);
+                localStorage.setItem("dm_notes", JSON.stringify(updated));
+                setEditingNoteId(newNote.id);
+              }} className="w-full py-2.5 rounded-xl border border-dashed border-border/40 text-xs text-muted-foreground hover:text-foreground hover:border-amber-400/30 transition-all flex items-center justify-center gap-2">
+                <Icon name="Plus" size={13} />
+                Добавить заметку
+              </button>
+            </div>
+
+            <div className="px-5 py-3 border-t border-border/40 flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">
+                {notes.length > 0 ? `${notes.length} заметок` : ""}
+              </p>
+              <button onClick={() => { setNotesOpen(false); setEditingNoteId(null); }}
+                className="px-4 py-1.5 rounded-lg text-xs btn-primary">
+                Закрыть
+              </button>
             </div>
           </div>
         </div>
