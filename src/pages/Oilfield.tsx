@@ -193,25 +193,29 @@ export default function Oilfield() {
       setAiError("Нет API ключа — настрой его в главном приложении (шестерёнка)");
       return;
     }
+    // Захватываем текущий срез данных ДО async — не будет устаревших замыканий
+    const currentField = fields[selectedIdx];
+    const currentIdx = selectedIdx;
+
     setAiAnalyzing(true);
     setAiError(null);
     try {
       const model = settings.model === "__custom__" ? settings.customModel : settings.model;
-      // Строим таблицу текущих данных для ИИ
-      const yearsLine = ["Показатель", ...selected.years.map(String)].join("\t");
-      const dataLines = selected.chart1Rows.map(row =>
+
+      const yearsLine = ["Показатель", ...currentField.years.map(String)].join("\t");
+      const dataLines = currentField.chart1Rows.map(row =>
         [row.indicator, ...row.values.map(v => v !== null ? String(v) : "")].join("\t")
       );
       const tableText = [yearsLine, ...dataLines].join("\n");
 
-      const systemPrompt = `Ты аналитик нефтяных месторождений. Тебе дана таблица изменений показателей разработки по годам (в %). 
-Проанализируй данные и верни ТОЛЬКО JSON объект вида:
+      const systemPrompt = `Ты аналитик нефтяных месторождений. Тебе дана таблица изменений показателей разработки по годам (%).
+Проанализируй данные и верни ТОЛЬКО JSON объект (без markdown, без пояснений) вида:
 {"rows": [{"indicator": "название", "values": [число_или_null, ...]}, ...]}
 где values — массив чисел для каждого года в том же порядке что в исходной таблице.
 Ты можешь скорректировать значения или рассчитать пустые клетки на основе взаимосвязей показателей.
-Если данных нет для расчёта — оставь null. Верни ВСЕ ${selected.chart1Rows.length} строк в том же порядке.`;
+Если данных нет для расчёта — оставь null. Верни ВСЕ ${currentField.chart1Rows.length} строк в том же порядке.`;
 
-      const userPrompt = `Месторождение: ${selected.name}\n\nТаблица изменений показателей (%):\n${tableText}\n\nПроанализируй и верни скорректированные данные в JSON.`;
+      const userPrompt = `Месторождение: ${currentField.name}\n\nТаблица изменений показателей (%):\n${tableText}\n\nПроанализируй и верни скорректированные данные в JSON.`;
 
       const resp = await fetch(`${settings.baseUrl}/chat/completions`, {
         method: "POST",
@@ -221,30 +225,40 @@ export default function Oilfield() {
           messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
           max_tokens: 2000,
           temperature: 0.1,
-          response_format: { type: "json_object" },
         }),
       });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok) {
+        const errBody = await resp.json().catch(() => ({})) as { error?: { message?: string } };
+        throw new Error(errBody.error?.message || `HTTP ${resp.status}`);
+      }
       const json = await resp.json() as { choices: { message: { content: string } }[] };
       const raw = json.choices?.[0]?.message?.content ?? "{}";
-      let parsed: { rows?: { indicator: string; values: (number | null)[] }[] };
-      try { parsed = JSON.parse(raw); } catch { throw new Error("ИИ вернул некорректный JSON"); }
+      console.log("[OILFIELD AI RAW]", raw.slice(0, 1000));
 
-      if (parsed.rows && Array.isArray(parsed.rows)) {
-        const updatedRows = selected.chart1Rows.map((origRow, i) => {
-          const aiRow = parsed.rows!.find(r => r.indicator === origRow.indicator) || parsed.rows![i];
-          if (!aiRow) return origRow;
-          const values = selected.years.map((_, yi) => {
-            const v = aiRow.values[yi];
-            return (v !== null && v !== undefined && !isNaN(Number(v))) ? Number(v) : origRow.values[yi];
-          });
-          return { ...origRow, values };
-        });
-        updateField({ ...selected, chart1Rows: updatedRows });
-      } else {
-        throw new Error("ИИ не вернул данные в ожидаемом формате");
+      // Надёжный парсинг — вырезаем JSON даже если модель обернула его в ```json
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("ИИ не вернул JSON в ответе");
+      let parsed: { rows?: { indicator: string; values: (number | null)[] }[] };
+      try { parsed = JSON.parse(jsonMatch[0]); } catch { throw new Error("Не удалось разобрать JSON от ИИ"); }
+
+      if (!parsed.rows || !Array.isArray(parsed.rows)) {
+        throw new Error("ИИ не вернул поле rows");
       }
+
+      const updatedRows = currentField.chart1Rows.map((origRow, i) => {
+        const aiRow = parsed.rows!.find(r => r.indicator === origRow.indicator) ?? parsed.rows![i];
+        if (!aiRow) return origRow;
+        const values = currentField.years.map((_, yi) => {
+          const v = aiRow.values[yi];
+          return (v !== null && v !== undefined && !isNaN(Number(v))) ? Number(v) : origRow.values[yi];
+        });
+        return { ...origRow, values };
+      });
+
+      // Обновляем через setFields напрямую — не через замыкание updateField
+      setFields(prev => prev.map((f, i) => i === currentIdx ? { ...f, chart1Rows: updatedRows } : f));
     } catch (e) {
+      console.error("[OILFIELD AI ERROR]", e);
       setAiError(e instanceof Error ? e.message : "Ошибка анализа");
     } finally {
       setAiAnalyzing(false);
