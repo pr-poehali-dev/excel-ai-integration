@@ -15,25 +15,25 @@ import func2url from "../../backend/func2url.json";
 
 const EXPORT_URL = (func2url as Record<string, string>)["export-xlsx"] ?? "";
 
-// Ключевые слова для поиска показателей в xlsx
+// Ключевые слова для поиска показателей по тексту строки
 const INDICATOR_KEYWORDS: Record<string, string[]> = {
-  "Добыча нефти":               ["добыча нефти", "нефть, тыс", "добычи нефти"],
-  "Добыча жидкости":            ["добыча жидкости", "жидкость, тыс", "добычи жидкости"],
-  "Обводненность (весовая)":    ["обводненность", "обводн", "весовая"],
-  "Дейст. добывающий фонд":     ["фонд добыв", "добывающих скв", "действующий фонд доб", "фонд доб"],
-  "Дейст. нагнетательный фонд": ["фонд нагн", "нагнетательных скв", "действующий фонд наг"],
-  "Закачка":                    ["закачка", "закачки"],
-  "Приемистость":               ["приемистость", "приёмистость", "приимистость"],
-  "Дебит нефти":                ["дебит нефти", "дебит нефт"],
-  "Дебит жидкости":             ["дебит жидкости", "дебит жидк"],
+  "Добыча нефти":               ["добыча нефти всего", "добыча нефти"],
+  "Добыча жидкости":            ["добыча жидкости всего", "добыча жидкости"],
+  "Обводненность (весовая)":    ["обводненность продукции", "средняя обводненность", "обводненность"],
+  "Дейст. добывающий фонд":     ["действующий фонд добывающих", "фонд добывающих нефтяных", "фонд добыв"],
+  "Дейст. нагнетательный фонд": ["действующий фонд нагнетательных", "фонд нагнетательных скв", "фонд нагн"],
+  "Закачка":                    ["закачка рабочего агента", "закачка"],
+  "Приемистость":               ["средняя приемистость", "приемистость нагнетательных", "приемистость", "приёмистость"],
+  "Дебит нефти":                ["средний дебит действующих скважин по нефти", "дебит нефти"],
+  "Дебит жидкости":             ["средний дебит действующих скважин по жидкости", "дебит жидкости"],
 };
 
 const CHART2_KEYWORDS: Record<string, string[]> = {
-  zakachka:     ["закачка", "закачки"],
-  liquid:       ["добыча жидкости", "жидкость, тыс"],
-  oil:          ["добыча нефти", "нефть, тыс"],
-  fond_dob:     ["фонд добыв", "добывающих скв"],
-  fond_nag:     ["фонд нагн", "нагнетательных скв"],
+  zakachka:     ["закачка рабочего агента", "закачка"],
+  liquid:       ["добыча жидкости всего", "добыча жидкости"],
+  oil:          ["добыча нефти всего", "добыча нефти"],
+  fond_dob:     ["действующий фонд добывающих", "фонд добывающих нефтяных"],
+  fond_nag:     ["действующий фонд нагнетательных", "фонд нагнетательных скв"],
   compensation: ["компенсация"],
 };
 
@@ -46,16 +46,17 @@ function toNum(v: string | number | null | undefined): number | null {
   return null;
 }
 
-function rowText(row: (string | number | null)[]): string {
-  return row.map(c => String(c ?? "").toLowerCase()).join(" | ");
-}
-
 function matchesAny(text: string, keywords: string[]): boolean {
-  return keywords.some(k => text.includes(k.toLowerCase()));
+  const low = text.toLowerCase();
+  return keywords.some(k => low.includes(k.toLowerCase()));
 }
 
-// Универсальный парсер: читает всю таблицу, ищет строки с "проект" и "факт"
-// рядом с названием показателя
+/**
+ * Структура таблицы:
+ * - Строка с годами: ...| 2021 | 2021 | 2022 | 2022 | ... (каждый год = 2 колонки: Проект, Факт)
+ * - Следующая строка: ...| Проект | Факт | Проект | Факт | ...
+ * - Данные: название показателя | ед.изм | Проект2021 | Факт2021 | Проект2022 | Факт2022 | ...
+ */
 function parseXlsxLocally(file: File): Promise<{ fields: OilfieldData[]; log: string[] }> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -73,133 +74,148 @@ function parseXlsxLocally(file: File): Promise<{ fields: OilfieldData[]; log: st
             defval: null,
           });
 
-          log.push(`Лист: ${sheetName}, строк: ${rows.length}`);
-          // Дамп первых 30 строк для отладки
-          rows.slice(0, 30).forEach((row, ri) => {
-            const cells = row.slice(0, 10).map(c => c === null ? "∅" : String(c)).join(" | ");
-            console.log(`[XLSX] r${ri}: ${cells}`);
-          });
-
+          log.push(`Лист: "${sheetName}", строк: ${rows.length}`);
           const field = createDefaultOilfield(sheetName);
 
-          // 1. Найти строку с годами
-          let headerRowIdx = -1;
-          let yearColIdxs: number[] = [];
+          // 1. Найти строку с годами — ищем строку где много чисел 2000-2050
+          //    Годы повторяются (каждый дважды: Проект + Факт), берём уникальные
+          let yearRowIdx = -1;
+          // Индексы колонок: proj[i] = колонка Проект для года i, fact[i] = колонка Факт
+          let projColIdxs: number[] = [];
+          let factColIdxs: number[] = [];
           let years: number[] = [];
 
-          for (let ri = 0; ri < Math.min(rows.length, 20); ri++) {
+          for (let ri = 0; ri < Math.min(rows.length, 15); ri++) {
             const row = rows[ri];
-            const yearCols: { idx: number; year: number }[] = [];
+            const yearEntries: { ci: number; year: number }[] = [];
             row.forEach((v, ci) => {
               const n = typeof v === "number" ? v : toNum(v);
-              if (n !== null && n >= 2000 && n <= 2050) {
-                yearCols.push({ idx: ci, year: n });
-              }
+              if (n !== null && n >= 2000 && n <= 2050) yearEntries.push({ ci, year: n });
             });
-            if (yearCols.length >= 2) {
-              headerRowIdx = ri;
-              yearColIdxs = yearCols.map(y => y.idx);
-              years = yearCols.map(y => y.year);
-              log.push(`  Годы найдены в строке ${ri}: ${years.join(", ")} (колонки: ${yearColIdxs.join(",")})`);
+            if (yearEntries.length >= 2) {
+              yearRowIdx = ri;
+              // Группируем: каждый уникальный год встречается дважды подряд
+              const seen = new Map<number, number[]>();
+              yearEntries.forEach(({ ci, year }) => {
+                if (!seen.has(year)) seen.set(year, []);
+                seen.get(year)!.push(ci);
+              });
+              // Определяем порядок лет по первому вхождению
+              const orderedYears: number[] = [];
+              yearEntries.forEach(({ year }) => {
+                if (!orderedYears.includes(year)) orderedYears.push(year);
+              });
+              years = orderedYears;
+              // Для каждого года: первая колонка = Проект, вторая = Факт
+              projColIdxs = [];
+              factColIdxs = [];
+              for (const yr of years) {
+                const cols = seen.get(yr) ?? [];
+                projColIdxs.push(cols[0] ?? -1);
+                factColIdxs.push(cols[1] ?? cols[0] ?? -1);
+              }
+              log.push(`  Годы: ${years.join(", ")}`);
+              log.push(`  Проект колонки: ${projColIdxs.join(", ")}`);
+              log.push(`  Факт колонки: ${factColIdxs.join(", ")}`);
               break;
             }
           }
 
-          if (headerRowIdx < 0 || years.length === 0) {
+          // Проверим строку "Проект/Факт" сразу после строки годов — уточним колонки
+          if (yearRowIdx >= 0) {
+            const subRow = rows[yearRowIdx + 1] ?? [];
+            const subText = subRow.map(c => String(c ?? "").toLowerCase());
+            // Если в следующей строке есть "проект"/"факт" — используем их для уточнения
+            const hasProjFact = subText.some(t => t.includes("проект") || t.includes("факт"));
+            if (hasProjFact) {
+              projColIdxs = [];
+              factColIdxs = [];
+              // Для каждого года ищем ближайшие "проект" и "факт" в subRow
+              years.forEach((yr) => {
+                // Найдём позиции года в yearRow
+                const yearRow = rows[yearRowIdx];
+                const yearCols: number[] = [];
+                yearRow.forEach((v, ci) => {
+                  const n = typeof v === "number" ? v : toNum(v);
+                  if (n === yr) yearCols.push(ci);
+                });
+                // В subRow ищем "проект" и "факт" среди этих позиций и ±2
+                let pCol = -1, fCol = -1;
+                for (const ci of yearCols) {
+                  for (let d = 0; d <= 2; d++) {
+                    const t1 = subText[ci + d] ?? "";
+                    const t2 = subText[ci - d] ?? "";
+                    if (pCol < 0 && t1.includes("проект")) pCol = ci + d;
+                    if (pCol < 0 && t2.includes("проект")) pCol = ci - d;
+                    if (fCol < 0 && t1.includes("факт")) fCol = ci + d;
+                    if (fCol < 0 && t2.includes("факт")) fCol = ci - d;
+                  }
+                }
+                projColIdxs.push(pCol >= 0 ? pCol : yearCols[0] ?? -1);
+                factColIdxs.push(fCol >= 0 ? fCol : yearCols[1] ?? yearCols[0] ?? -1);
+              });
+              log.push(`  После уточнения проект: ${projColIdxs.join(", ")}, факт: ${factColIdxs.join(", ")}`);
+            }
+          }
+
+          if (yearRowIdx < 0 || years.length === 0) {
             log.push(`  ОШИБКА: строка с годами не найдена`);
             fields.push(field);
             return;
           }
 
           field.years = years;
+          // Данные начинаются через 2 строки после годов (строка годов + строка Проект/Факт)
+          const dataStartIdx = yearRowIdx + 2;
+          const dataRows = rows.slice(dataStartIdx);
 
-          // 2. Строим индекс: для каждой строки — её текст и значения по колонкам годов
-          interface RowInfo {
-            ri: number;
-            text: string;       // весь текст строки в нижнем регистре
-            firstCells: string; // первые 4 ячейки
-            values: (number | null)[];
-          }
+          // Извлечь Проект и Факт значения из строки данных
+          const extractProjFact = (row: (string|number|null)[]) => ({
+            proj: projColIdxs.map(ci => ci >= 0 ? toNum(row[ci]) : null),
+            fact: factColIdxs.map(ci => ci >= 0 ? toNum(row[ci]) : null),
+          });
 
-          const rowInfos: RowInfo[] = rows.slice(headerRowIdx + 1).map((row, ri) => ({
-            ri,
-            text: rowText(row),
-            firstCells: row.slice(0, 6).map(c => String(c ?? "").toLowerCase()).join(" "),
-            values: yearColIdxs.map(ci => toNum(row[ci])),
-          }));
-
-          // 3. Для показателя ищем его строку, потом ищем строки проект/факт рядом
-          const findProjFact = (
-            indicatorName: string,
-            keywords: string[]
-          ): { proj: (number|null)[]; fact: (number|null)[] } | null => {
-
-            // Ищем строку, где упоминается показатель
-            // Это может быть сама строка Проект или строка-заголовок показателя
-            for (let i = 0; i < rowInfos.length; i++) {
-              const r = rowInfos[i];
-              if (!matchesAny(r.firstCells, keywords)) continue;
-
-              // Нашли строку с упоминанием показателя
-              // Смотрим её и следующие 8 строк на наличие "проект" и "факт"
-              let projRow: RowInfo | null = null;
-              let factRow: RowInfo | null = null;
-
-              const window = rowInfos.slice(i, i + 9);
-              for (const wr of window) {
-                if (!projRow && wr.text.includes("проект") && !wr.text.includes("факт")) {
-                  projRow = wr;
-                }
-                if (!factRow && wr.text.includes("факт") && !wr.text.includes("прогноз")) {
-                  factRow = wr;
-                }
-                if (projRow && factRow) break;
-              }
-
-              // Если не нашли оба — пробуем обратное: сама строка является проектом или фактом
-              if (!projRow && r.text.includes("проект")) projRow = r;
-              if (!factRow && r.text.includes("факт")) factRow = r;
-
-              if (!projRow && !factRow) continue;
-
-              log.push(`  ${indicatorName}: proj=${projRow ? `строка ${projRow.ri}` : "нет"} fact=${factRow ? `строка ${factRow.ri}` : "нет"}`);
-              if (projRow) log.push(`    proj vals: ${projRow.values.join(", ")}`);
-              if (factRow) log.push(`    fact vals: ${factRow.values.join(", ")}`);
-
-              return {
-                proj: projRow ? projRow.values : years.map(() => null),
-                fact: factRow ? factRow.values : years.map(() => null),
-              };
+          // Найти строку данных по ключевым словам (ищем в первых 4 колонках)
+          const findDataRow = (keywords: string[]): (string|number|null)[] | null => {
+            for (const row of dataRows) {
+              const text = row.slice(0, 5).map(c => String(c ?? "")).join(" ");
+              if (matchesAny(text, keywords)) return row;
             }
-
-            log.push(`  ${indicatorName}: НЕ НАЙДЕНО (ключи: ${keywords.join(", ")})`);
             return null;
           };
 
-          // 4. Chart1: отклонения %
+          // Chart1: отклонения %
           const chart1Rows = CHART1_INDICATORS.map((indicator) => {
             const keywords = INDICATOR_KEYWORDS[indicator] ?? [indicator.toLowerCase()];
-            const pf = findProjFact(indicator, keywords);
-            if (!pf) return { indicator, values: years.map(() => null as number | null) };
-
+            const row = findDataRow(keywords);
+            if (!row) {
+              log.push(`  НЕ НАЙДЕНО: ${indicator}`);
+              return { indicator, values: years.map(() => null as number | null) };
+            }
+            const { proj, fact } = extractProjFact(row);
+            log.push(`  ${indicator}: proj=[${proj.join(",")}] fact=[${fact.join(",")}]`);
             const values = years.map((_, yi) => {
-              const proj = pf.proj[yi];
-              const fact = pf.fact[yi];
-              if (proj === null || fact === null || proj === 0) return null;
-              return Math.round((fact - proj) / Math.abs(proj) * 1000) / 10;
+              const p = proj[yi], f = fact[yi];
+              if (p === null || f === null || p === 0) return null;
+              return Math.round((f - p) / Math.abs(p) * 1000) / 10;
             });
             return { indicator, values };
           });
           field.chart1Rows = chart1Rows;
 
-          // 5. Chart2: значения Факт
+          // Chart2: значения Факт
           const chart2Keys = ["zakachka", "liquid", "oil", "fond_dob", "fond_nag", "compensation"] as const;
           const chart2 = { years, zakachka: [] as number[], liquid: [] as number[], oil: [] as number[], fond_dob: [] as number[], fond_nag: [] as number[], compensation: [] as number[] };
 
           for (const key of chart2Keys) {
             const keywords = CHART2_KEYWORDS[key] ?? [];
-            const pf = findProjFact(key, keywords);
-            chart2[key] = pf ? pf.fact.map(v => v ?? 0) : years.map(() => 0);
+            const row = findDataRow(keywords);
+            if (row) {
+              const { fact } = extractProjFact(row);
+              chart2[key] = fact.map(v => v ?? 0);
+            } else {
+              chart2[key] = years.map(() => 0);
+            }
           }
           field.chart2Data = chart2;
 
