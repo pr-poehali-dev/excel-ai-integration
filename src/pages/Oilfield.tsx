@@ -74,6 +74,11 @@ function parseXlsxLocally(file: File): Promise<{ fields: OilfieldData[]; log: st
           });
 
           log.push(`Лист: ${sheetName}, строк: ${rows.length}`);
+          // Дамп первых 30 строк для отладки
+          rows.slice(0, 30).forEach((row, ri) => {
+            const cells = row.slice(0, 10).map(c => c === null ? "∅" : String(c)).join(" | ");
+            console.log(`[XLSX] r${ri}: ${cells}`);
+          });
 
           const field = createDefaultOilfield(sheetName);
 

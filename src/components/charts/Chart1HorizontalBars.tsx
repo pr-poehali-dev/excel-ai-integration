@@ -23,33 +23,43 @@ const NEGATIVE_COLOR = "#808080";
 const CHART_HEIGHT = 290;
 const LABEL_WIDTH = 165;
 
-// Кастомный тик YAxis — подпись показателя встроена в ось, выровнена с баром
+// Кастомный SVG-тик: текст с переносом строк, надёжно в любом браузере
 const CustomYTick = (props: { x?: number; y?: number; payload?: { value: string } }) => {
   const { x = 0, y = 0, payload } = props;
-  if (!payload) return null;
+  if (!payload?.value) return null;
+
+  // Делим на строки по ~22 символа
+  const words = payload.value.split(" ");
+  const lines: string[] = [];
+  let cur = "";
+  for (const w of words) {
+    if (cur.length + w.length + 1 > 22 && cur.length > 0) {
+      lines.push(cur);
+      cur = w;
+    } else {
+      cur = cur ? cur + " " + w : w;
+    }
+  }
+  if (cur) lines.push(cur);
+
+  const lineH = 13;
+  const totalH = (lines.length - 1) * lineH;
+
   return (
-    <foreignObject x={x - LABEL_WIDTH} y={y - 13} width={LABEL_WIDTH - 4} height={26}>
-      <div
-        xmlns="http://www.w3.org/1999/xhtml"
-        style={{
-          fontSize: 11,
-          color: "#444",
-          fontFamily: "Calibri, Arial, sans-serif",
-          lineHeight: 1.2,
-          textAlign: "right",
-          paddingRight: 6,
-          height: "100%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "flex-end",
-          overflow: "hidden",
-          whiteSpace: "nowrap",
-        }}
-        title={payload.value}
-      >
-        {payload.value}
-      </div>
-    </foreignObject>
+    <g>
+      {lines.map((line, i) => (
+        <text
+          key={i}
+          x={x - 6}
+          y={y - totalH / 2 + i * lineH}
+          textAnchor="end"
+          dominantBaseline="middle"
+          style={{ fontSize: 11, fill: "#444", fontFamily: "Calibri, Arial, sans-serif" }}
+        >
+          {line}
+        </text>
+      ))}
+    </g>
   );
 };
 
