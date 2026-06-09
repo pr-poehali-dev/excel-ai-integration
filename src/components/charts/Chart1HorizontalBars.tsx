@@ -21,13 +21,45 @@ interface Props {
 const POSITIVE_COLOR = "#4472C4";
 const NEGATIVE_COLOR = "#808080";
 
+// Высота одного бара + промежуток между барами в Recharts при barSize=14
+const BAR_SIZE = 14;
+const CHART_HEIGHT = 280;
+
 export default function Chart1HorizontalBars({ years, rows }: Props) {
+  const n = rows.length;
+
+  // Recharts раскидывает n баров равномерно по высоте.
+  // Высота на один элемент = CHART_HEIGHT / n
+  const itemHeight = CHART_HEIGHT / n;
+
   return (
     <div className="bg-white rounded border border-gray-300 p-3">
       <div className="text-sm font-bold text-center text-gray-800 mb-3">
         Анализ изменений показателей по годам, %
       </div>
-      <div className="flex gap-1 overflow-x-auto">
+
+      <div className="flex gap-0 overflow-x-auto items-stretch">
+
+        {/* Подписи показателей — выровнены по барам */}
+        <div
+          className="flex-shrink-0 flex flex-col"
+          style={{ width: 170, paddingTop: 18 /* отступ под ось X */ }}
+        >
+          {rows.map((row, i) => (
+            <div
+              key={i}
+              className="text-xs text-gray-700 font-medium flex items-center pr-2"
+              style={{
+                height: itemHeight,
+                lineHeight: 1.25,
+              }}
+            >
+              {row.indicator}
+            </div>
+          ))}
+        </div>
+
+        {/* Графики по годам */}
         {years.map((year, yIdx) => {
           const chartData = rows.map((row) => ({
             name: row.indicator,
@@ -35,16 +67,16 @@ export default function Chart1HorizontalBars({ years, rows }: Props) {
           }));
 
           return (
-            <div key={year} className="flex-shrink-0" style={{ width: 160 }}>
+            <div key={year} className="flex-shrink-0" style={{ width: 155 }}>
               <div className="text-xs font-bold text-center text-gray-700 mb-1 underline">
                 {year}
               </div>
-              <ResponsiveContainer width="100%" height={260}>
+              <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
                 <BarChart
                   data={chartData}
                   layout="vertical"
-                  margin={{ top: 0, right: 30, left: 4, bottom: 0 }}
-                  barSize={14}
+                  margin={{ top: 0, right: 28, left: 4, bottom: 0 }}
+                  barSize={BAR_SIZE}
                 >
                   <CartesianGrid
                     strokeDasharray="2 2"
@@ -94,22 +126,6 @@ export default function Chart1HorizontalBars({ years, rows }: Props) {
             </div>
           );
         })}
-
-        {/* Легенда — названия показателей */}
-        <div
-          className="flex-shrink-0 flex flex-col justify-start pt-6"
-          style={{ width: 180, paddingTop: 28 }}
-        >
-          {rows.map((row, i) => (
-            <div
-              key={i}
-              className="text-xs text-gray-700 font-medium"
-              style={{ height: 260 / rows.length, display: "flex", alignItems: "center" }}
-            >
-              {row.indicator}
-            </div>
-          ))}
-        </div>
       </div>
 
       {/* Легенда цветов */}

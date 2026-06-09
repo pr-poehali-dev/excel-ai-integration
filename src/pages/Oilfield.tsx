@@ -2,8 +2,6 @@ import React, { useRef, useState, useCallback } from "react";
 import * as XLSX from "xlsx";
 import { useNavigate } from "react-router-dom";
 import Icon from "@/components/ui/icon";
-import { Button } from "@/components/ui/button";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import Chart1HorizontalBars from "@/components/charts/Chart1HorizontalBars";
 import Chart2ComboChart from "@/components/charts/Chart2ComboChart";
 import Chart1Editor from "@/components/editor/Chart1Editor";
@@ -15,9 +13,46 @@ import {
 } from "@/types/oilfield";
 import func2url from "../../backend/func2url.json";
 
-
-
 const EXPORT_URL = (func2url as Record<string, string>)["export-xlsx"] ?? "";
+
+// Маппинг: название показателя в Chart1 → ключевые слова для поиска в xlsx (строки Проект/Факт)
+const INDICATOR_KEYWORDS: Record<string, string[]> = {
+  "Добыча нефти":                   ["добыча нефти", "нефть, тыс.т", "добыча нефти, тыс"],
+  "Добыча жидкости":                ["добыча жидкости", "жидкость, тыс.т", "добыча жидкости, тыс"],
+  "Обводненность (весовая)":        ["обводненность", "обводн"],
+  "Дейст. добывающий фонд":         ["фонд доб", "добывающ", "фонд добывающих", "добыв. скв", "фонд добыв"],
+  "Дейст. нагнетательный фонд":     ["фонд нагн", "нагнетател", "нагн. скв", "фонд нагнет"],
+  "Закачка":                        ["закачка", "закачка рабочего", "закачка, тыс.м"],
+  "Приемистость":                   ["приемистость", "приёмистость"],
+  "Дебит нефти":                    ["дебит нефти", "дебит нефт"],
+  "Дебит жидкости":                 ["дебит жидкости", "дебит жидк"],
+};
+
+// Маппинг: поле chart2 → ключевые слова для поиска строки Факт
+const CHART2_KEYWORDS: Record<keyof import("@/types/oilfield").Chart2Data, string[]> = {
+  years:        [],
+  zakachka:     ["закачка"],
+  liquid:       ["добыча жидкости", "жидкость"],
+  oil:          ["добыча нефти", "нефть"],
+  fond_dob:     ["фонд доб", "добывающ"],
+  fond_nag:     ["фонд нагн", "нагнетател"],
+  compensation: ["компенсация"],
+};
+
+function toNum(v: string | number | null): number | null {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const n = parseFloat(v.replace(",", ".").replace("%", "").trim());
+    return isNaN(n) ? null : n;
+  }
+  return null;
+}
+
+function cellMatchesKeywords(cell: string | number | null, keywords: string[]): boolean {
+  if (!cell) return false;
+  const low = String(cell).toLowerCase();
+  return keywords.some(k => low.includes(k.toLowerCase()));
+}
 
 function parseXlsxLocally(file: File): Promise<OilfieldData[]> {
   return new Promise((resolve, reject) => {
@@ -37,40 +72,119 @@ function parseXlsxLocally(file: File): Promise<OilfieldData[]> {
 
           const field = createDefaultOilfield(sheetName);
 
+          // 1. Найти строку с годами (заголовок)
           let headerRowIdx = -1;
-          let yearsFound: number[] = [];
-          for (let ri = 0; ri < Math.min(rows.length, 10); ri++) {
+          let yearColIdxs: number[] = [];
+          let years: number[] = [];
+
+          for (let ri = 0; ri < Math.min(rows.length, 15); ri++) {
             const row = rows[ri];
-            const numCols = row.filter(
-              (v) => typeof v === "number" && v >= 2000 && v <= 2050
-            );
-            if (numCols.length >= 2) {
+            const yearCols: { idx: number; year: number }[] = [];
+            row.forEach((v, ci) => {
+              if (typeof v === "number" && v >= 2000 && v <= 2050) {
+                yearCols.push({ idx: ci, year: v });
+              }
+            });
+            if (yearCols.length >= 2) {
               headerRowIdx = ri;
-              yearsFound = row
-                .filter((v): v is number => typeof v === "number" && v >= 2000 && v <= 2050)
-                .slice(0, 10);
+              yearColIdxs = yearCols.map(y => y.idx);
+              years = yearCols.map(y => y.year);
               break;
             }
           }
 
-          if (headerRowIdx >= 0 && yearsFound.length > 0) {
-            field.years = yearsFound;
-            const dataRows = rows.slice(headerRowIdx + 1);
-            const chart1Rows = CHART1_INDICATORS.map((indicator, iIdx) => {
-              const dataRow = dataRows[iIdx];
-              const values: (number | null)[] = yearsFound.map((_, yIdx) => {
-                const cell = dataRow?.[yIdx + 1];
-                if (typeof cell === "number") return cell;
-                if (typeof cell === "string") {
-                  const parsed = parseFloat(cell.replace(",", ".").replace("%", ""));
-                  return isNaN(parsed) ? null : parsed;
-                }
-                return null;
-              });
-              return { indicator, values };
-            });
-            field.chart1Rows = chart1Rows;
+          if (headerRowIdx < 0 || years.length === 0) {
+            fields.push(field);
+            return;
           }
+
+          field.years = years;
+          const dataRows = rows.slice(headerRowIdx + 1);
+
+          // Для каждого показателя ищем строки "Проект" и "Факт"
+          // Ищем по контексту: показатель в col0/1, "проект"/"факт" в следующих col0/1
+
+          // Индексируем все строки: для каждой строки смотрим первые 3 ячейки
+          // Алгоритм: идём по строкам, если ячейка совпадает с ключевыми словами показателя —
+          // ищем следующие строки где написано "проект" или "факт"
+
+          const findProjFact = (keywords: string[]): { proj: (number|null)[]; fact: (number|null)[] } | null => {
+            for (let ri = 0; ri < dataRows.length; ri++) {
+              const row = dataRows[ri];
+              // Проверяем первые 3 колонки на совпадение с ключевым словом показателя
+              const cellsToCheck = [row[0], row[1], row[2]].filter(Boolean);
+              const isIndicatorRow = cellsToCheck.some(c => cellMatchesKeywords(c, keywords));
+              if (!isIndicatorRow) continue;
+
+              // Нашли строку с названием показателя
+              // Ищем "проект" и "факт" в диапазоне ±5 строк
+              let projRow: (string | number | null)[] | null = null;
+              let factRow: (string | number | null)[] | null = null;
+
+              // Сначала проверяем саму строку — может быть "проект" уже в ней
+              const allCells = [row[0], row[1], row[2], row[3]].map(c => String(c ?? "").toLowerCase());
+              if (allCells.some(c => c.includes("проект"))) projRow = row;
+              if (allCells.some(c => c.includes("факт"))) factRow = row;
+
+              // Ищем в соседних строках (вперёд до 6 строк)
+              for (let di = 1; di <= 6 && (!projRow || !factRow); di++) {
+                const nextRow = dataRows[ri + di];
+                if (!nextRow) break;
+                const nextCells = [nextRow[0], nextRow[1], nextRow[2], nextRow[3]].map(c => String(c ?? "").toLowerCase());
+                // Если строка уже относится к другому показателю — стоп
+                const isOtherIndicator = Object.values(INDICATOR_KEYWORDS).some(kws =>
+                  !keywords.some(k => kws.includes(k)) && nextCells.some(c => kws.some(kw => c.includes(kw.toLowerCase())))
+                );
+                if (isOtherIndicator && di > 1) break;
+                if (!projRow && nextCells.some(c => c.includes("проект"))) projRow = nextRow;
+                if (!factRow && nextCells.some(c => c.includes("факт") && !c.includes("проект"))) factRow = nextRow;
+              }
+
+              if (!projRow && !factRow) continue;
+
+              const extractValues = (r: (string | number | null)[]): (number|null)[] =>
+                yearColIdxs.map(ci => toNum(r[ci]));
+
+              return {
+                proj: projRow ? extractValues(projRow) : years.map(() => null),
+                fact: factRow ? extractValues(factRow) : years.map(() => null),
+              };
+            }
+            return null;
+          };
+
+          // Chart1: (Факт - Проект) / |Проект| * 100
+          const chart1Rows = CHART1_INDICATORS.map((indicator) => {
+            const keywords = INDICATOR_KEYWORDS[indicator] ?? [indicator.toLowerCase()];
+            const pf = findProjFact(keywords);
+            if (!pf) return { indicator, values: years.map(() => null as number | null) };
+
+            const values = years.map((_, yi) => {
+              const proj = pf.proj[yi];
+              const fact = pf.fact[yi];
+              if (proj === null || fact === null || proj === 0) return null;
+              return Math.round((fact - proj) / Math.abs(proj) * 1000) / 10; // 1 знак
+            });
+            return { indicator, values };
+          });
+          field.chart1Rows = chart1Rows;
+
+          // Chart2: берём Факт-строки тех же показателей
+          const getFactValues = (keywords: string[]): number[] => {
+            const pf = findProjFact(keywords);
+            if (!pf) return years.map(() => 0);
+            return pf.fact.map(v => v ?? 0);
+          };
+
+          field.chart2Data = {
+            years,
+            zakachka:     getFactValues(CHART2_KEYWORDS.zakachka),
+            liquid:       getFactValues(CHART2_KEYWORDS.liquid),
+            oil:          getFactValues(CHART2_KEYWORDS.oil),
+            fond_dob:     getFactValues(CHART2_KEYWORDS.fond_dob),
+            fond_nag:     getFactValues(CHART2_KEYWORDS.fond_nag),
+            compensation: getFactValues(CHART2_KEYWORDS.compensation),
+          };
 
           fields.push(field);
         });
@@ -96,9 +210,7 @@ export default function Oilfield() {
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
-  const [aiError, setAiError] = useState<string | null>(null);
-  const [pasteOpen, setPasteOpen] = useState(false);
-  const [pasteText, setPasteText] = useState("");
+  const [parseLog, setParseLog] = useState<string | null>(null);
 
   const selected = fields[selectedIdx];
 
@@ -114,14 +226,25 @@ export default function Oilfield() {
     if (!file) return;
     setLoading(true);
     setFileName(file.name);
+    setParseLog(null);
     try {
       const parsed = await parseXlsxLocally(file);
       if (parsed.length > 0) {
         setFields(parsed);
         setSelectedIdx(0);
+        // Проверяем сколько данных нашлось
+        const firstField = parsed[0];
+        const filledCells = firstField.chart1Rows.reduce((acc, row) =>
+          acc + row.values.filter(v => v !== null).length, 0);
+        const totalCells = firstField.chart1Rows.length * firstField.years.length;
+        if (filledCells === 0) {
+          setParseLog(`Файл загружен, но данные Проект/Факт не найдены. Проверь структуру таблицы — нужны строки «Проект» и «Факт» для каждого показателя.`);
+        } else if (filledCells < totalCells * 0.5) {
+          setParseLog(`Загружено: ${filledCells} из ${totalCells} ячеек. Часть показателей не распознана.`);
+        }
       }
     } catch {
-      alert("Ошибка чтения файла. Проверьте формат xlsx.");
+      setParseLog("Ошибка чтения файла. Проверьте формат xlsx.");
     } finally {
       setLoading(false);
       e.target.value = "";
@@ -153,7 +276,6 @@ export default function Oilfield() {
         chart1_rows: selected.chart1Rows.map((r) => r.values),
         chart2_data: selected.chart2Data,
       };
-
       const resp = await fetch(EXPORT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -181,129 +303,10 @@ export default function Oilfield() {
     }
   };
 
-  // Извлекает все JSON-объекты из текста и возвращает самый "полезный"
-  const extractJsonFromText = (text: string): Record<string, unknown> | null => {
-    const candidates: Record<string, unknown>[] = [];
-    let i = 0;
-    while (i < text.length) {
-      if (text[i] !== '{') { i++; continue; }
-      // Находим закрывающую скобку с учётом вложенности
-      let depth = 0;
-      let j = i;
-      while (j < text.length) {
-        if (text[j] === '{') depth++;
-        else if (text[j] === '}') depth--;
-        if (depth === 0) break;
-        j++;
-      }
-      if (depth === 0) {
-        const candidate = text.slice(i, j + 1);
-        try {
-          const obj = JSON.parse(candidate) as Record<string, unknown>;
-          candidates.push(obj);
-        } catch { /* не JSON */ }
-      }
-      i++;
-    }
-    if (candidates.length === 0) return null;
-    // Предпочитаем объект с годами или analysis/rows, иначе самый большой
-    return (
-      candidates.find(o => Object.keys(o).some(k => /^\d{4}$/.test(k))) ??
-      candidates.find(o => o.analysis) ??
-      candidates.find(o => o.rows) ??
-      candidates.reduce((a, b) => JSON.stringify(a).length >= JSON.stringify(b).length ? a : b)
-    );
-  };
-
-  // Применяет данные из ответа ИИ к таблице
-  const applyAiJson = (raw: string, currentField: typeof fields[0], currentIdx: number) => {
-    type AnyObj = Record<string, unknown>;
-
-    const parsed = extractJsonFromText(raw);
-    if (!parsed) throw new Error("Не найден JSON с данными в тексте");
-
-    console.log("[APPLY AI] keys:", Object.keys(parsed));
-
-    // Формат 1: { rows: [{indicator, values}] }
-    if (parsed.rows && Array.isArray(parsed.rows)) {
-      const rows = parsed.rows as { indicator: string; values: (number | null)[] }[];
-      const updatedRows = currentField.chart1Rows.map((origRow, i) => {
-        const aiRow = rows.find(r => r.indicator === origRow.indicator) ?? rows[i];
-        if (!aiRow) return origRow;
-        const values = currentField.years.map((_, yi) => {
-          const v = aiRow.values[yi];
-          if (v === null || v === undefined) return origRow.values[yi];
-          const num = Number(v);
-          return isNaN(num) ? origRow.values[yi] : num;
-        });
-        return { ...origRow, values };
-      });
-      setFields(prev => prev.map((f, i) => i === currentIdx ? { ...f, chart1Rows: updatedRows } : f));
-      return;
-    }
-
-    // Формат 2: { analysis: { "2021": {...} } } или { "2021": {...} }
-    const analysisRoot = (parsed.analysis ?? parsed) as Record<string, unknown>;
-    const yearKeys = Object.keys(analysisRoot).filter(k => /^\d{4}$/.test(k)).sort();
-    if (yearKeys.length === 0) throw new Error(`Годы не найдены. Ключи в JSON: ${Object.keys(parsed).join(", ")}`);
-
-    const aiYears = yearKeys.map(Number);
-    const analysis = analysisRoot as Record<string, Record<string, AnyObj>>;
-
-    const PCT_FIELDS = ["откл%", "откл_%", "отклонение_%", "отклонение%", "процент", "percent", "pct", "delta_%", "delta%"];
-
-    const extractPct = (cell: AnyObj): number | null => {
-      for (const key of Object.keys(cell)) {
-        if (PCT_FIELDS.includes(key.toLowerCase())) {
-          const v = Number(cell[key]);
-          if (!isNaN(v)) return Math.round(v * 10) / 10;
-        }
-      }
-      // Берём первое числовое поле — обычно это и есть отклонение
-      for (const key of Object.keys(cell)) {
-        if (typeof cell[key] === "number") return Math.round((cell[key] as number) * 10) / 10;
-      }
-      return null;
-    };
-
-    let filledCount = 0;
-    const updatedRows = currentField.chart1Rows.map((origRow) => {
-      const origLow = origRow.indicator.toLowerCase();
-      const values = aiYears.map((yr, yi) => {
-        const yearData = analysis[String(yr)];
-        if (!yearData) return origRow.values[yi] ?? null;
-
-        const indicatorKey =
-          Object.keys(yearData).find(k => k.toLowerCase() === origLow) ??
-          Object.keys(yearData).find(k => k.toLowerCase().includes(origLow.slice(0, 6))) ??
-          Object.keys(yearData).find(k => origLow.includes(k.toLowerCase().slice(0, 6)));
-
-        if (!indicatorKey) return origRow.values[yi] ?? null;
-        const pct = extractPct(yearData[indicatorKey] as AnyObj);
-        if (pct !== null) filledCount++;
-        return pct ?? (origRow.values[yi] ?? null);
-      });
-      return { ...origRow, values };
-    });
-
-    console.log("[APPLY AI] filled cells:", filledCount, "years:", aiYears);
-    if (filledCount === 0) throw new Error("JSON найден, но не удалось извлечь числовые отклонения. Убедись что в ответе ИИ есть блок с годами и процентами.");
-
-    setFields(prev => prev.map((f, i) =>
-      i === currentIdx ? { ...f, years: aiYears, chart1Rows: updatedRows } : f
-    ));
-  };
-
-
-
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "#f5f5f5", fontFamily: "Calibri, Arial, sans-serif" }}>
-      {/* Шапка в стиле Excel */}
-      <div
-        className="border-b border-gray-400 flex-shrink-0"
-        style={{ background: "#217346" }}
-      >
-        {/* Ribbon верхний */}
+      {/* Шапка */}
+      <div className="border-b border-gray-400 flex-shrink-0" style={{ background: "#217346" }}>
         <div className="flex items-center gap-2 px-3 py-1.5">
           <button
             onClick={() => navigate("/")}
@@ -321,7 +324,6 @@ export default function Oilfield() {
           </div>
           <div className="flex-1" />
 
-          {/* Файл */}
           <label className="cursor-pointer">
             <input
               ref={fileInputRef}
@@ -336,17 +338,6 @@ export default function Oilfield() {
             </div>
           </label>
 
-          {activeTab === "chart1" && (
-            <button
-              onClick={() => { setPasteText(""); setPasteOpen(true); }}
-              className="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-semibold border transition"
-              style={{ background: "rgba(52,211,153,0.2)", borderColor: "rgba(52,211,153,0.6)", color: "#34d399" }}
-            >
-              <Icon name="Sparkles" size={13} />
-              Применить анализ ИИ
-            </button>
-          )}
-
           <button
             onClick={handleExport}
             disabled={exporting}
@@ -358,7 +349,7 @@ export default function Oilfield() {
           </button>
         </div>
 
-        {/* Вкладки листов */}
+        {/* Вкладки */}
         <div className="flex items-end gap-0.5 px-3 pt-1">
           {[
             { value: "chart1", label: "График 1: Изменения %" },
@@ -384,16 +375,16 @@ export default function Oilfield() {
         </div>
       </div>
 
-      {aiError && (
-        <div className="flex items-center gap-2 px-4 py-2 text-xs border-b border-red-300/40" style={{ background: "rgba(220,38,38,0.1)", color: "#fca5a5" }}>
+      {parseLog && (
+        <div className="flex items-center gap-2 px-4 py-2 text-xs border-b border-yellow-300/40" style={{ background: "rgba(234,179,8,0.1)", color: "#854d0e" }}>
           <Icon name="AlertCircle" size={13} />
-          {aiError}
-          <button onClick={() => setAiError(null)} className="ml-auto opacity-60 hover:opacity-100"><Icon name="X" size={12} /></button>
+          {parseLog}
+          <button onClick={() => setParseLog(null)} className="ml-auto opacity-60 hover:opacity-100"><Icon name="X" size={12} /></button>
         </div>
       )}
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Боковая панель месторождений */}
+        {/* Боковая панель */}
         <div
           className="flex-shrink-0 border-r border-gray-300 flex flex-col"
           style={{ width: 190, background: "#fff", minWidth: 150 }}
@@ -419,15 +410,10 @@ export default function Oilfield() {
                 <input
                   className="flex-1 bg-transparent outline-none text-xs min-w-0 cursor-pointer"
                   value={f.name}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setSelectedIdx(idx);
-                  }}
+                  onClick={(e) => { e.stopPropagation(); setSelectedIdx(idx); }}
                   onChange={(e) =>
                     setFields((prev) =>
-                      prev.map((ff, ii) =>
-                        ii === idx ? { ...ff, name: e.target.value } : ff
-                      )
+                      prev.map((ff, ii) => ii === idx ? { ...ff, name: e.target.value } : ff)
                     )
                   }
                   style={{
@@ -438,10 +424,7 @@ export default function Oilfield() {
                 {fields.length > 1 && (
                   <button
                     className="opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 text-xs"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      removeField(idx);
-                    }}
+                    onClick={(e) => { e.stopPropagation(); removeField(idx); }}
                   >
                     ×
                   </button>
@@ -460,7 +443,6 @@ export default function Oilfield() {
 
         {/* Рабочая область */}
         <div className="flex-1 overflow-auto" style={{ background: "#fafafa" }}>
-          {/* Строка формул как в Excel */}
           <div
             className="flex items-center gap-2 px-3 py-1 border-b border-gray-300 flex-shrink-0 sticky top-0 z-20"
             style={{ background: "#fff" }}
@@ -483,7 +465,6 @@ export default function Oilfield() {
           <div className="p-4 flex flex-col gap-4">
             {activeTab === "chart1" && (
               <>
-                {/* Таблица */}
                 <div className="bg-white border border-gray-400 shadow-sm">
                   <div
                     className="px-3 py-1 border-b border-gray-300 text-xs font-semibold flex items-center gap-2"
@@ -502,7 +483,6 @@ export default function Oilfield() {
                   </div>
                 </div>
 
-                {/* График */}
                 <div className="bg-white border border-gray-400 shadow-sm">
                   <div
                     className="px-3 py-1 border-b border-gray-300 text-xs font-semibold flex items-center gap-2"
@@ -529,7 +509,7 @@ export default function Oilfield() {
                     style={{ background: "#e8f5e9", color: "#1b5e20" }}
                   >
                     <Icon name="Table2" size={12} />
-                    Таблица данных — динамика показателей
+                    Таблица данных — динамика показателей (Факт)
                   </div>
                   <div className="p-2">
                     <Chart2Editor
@@ -556,82 +536,6 @@ export default function Oilfield() {
           </div>
         </div>
       </div>
-
-      {/* Модалка вставки ответа ИИ */}
-      {pasteOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center"
-          style={{ background: "rgba(0,0,0,0.5)" }}
-          onClick={(e) => { if (e.target === e.currentTarget) setPasteOpen(false); }}
-        >
-          <div className="bg-white rounded-lg shadow-xl flex flex-col" style={{ width: 560, maxHeight: "80vh" }}>
-            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200">
-              <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
-                <Icon name="ClipboardPaste" size={15} />
-                Вставить ответ ИИ
-              </div>
-              <button onClick={() => setPasteOpen(false)} className="text-gray-400 hover:text-gray-600">
-                <Icon name="X" size={16} />
-              </button>
-            </div>
-            <div className="px-4 py-2.5 text-xs border-b border-gray-100" style={{ background: "#f0f7f0", color: "#1b5e20" }}>
-              <b>Как использовать:</b> в чате DataMind попроси ИИ проанализировать таблицу проект/факт →
-              выдели весь ответ ИИ (Ctrl+A в поле чата) → скопируй (Ctrl+C) → вставь сюда (Ctrl+V) → нажми «Применить»
-            </div>
-            <textarea
-              autoFocus
-              className="flex-1 p-4 text-xs font-mono resize-none outline-none text-gray-700"
-              style={{ minHeight: 280 }}
-              placeholder={"Вставь сюда полный текст ответа ИИ...\n\nПрограмма автоматически найдёт в нём годы и процентные отклонения по каждому показателю и обновит таблицу."}
-              value={pasteText}
-              onChange={e => setPasteText(e.target.value)}
-            />
-            {pasteText.length > 0 && (() => {
-              const found = extractJsonFromText(pasteText);
-              const yearKeys = found ? Object.keys(found.analysis as object || found).filter(k => /^\d{4}$/.test(k)) : [];
-              return (
-                <div className="px-4 py-2 text-xs border-t border-gray-100" style={{
-                  background: found && (yearKeys.length > 0 || (found as Record<string,unknown>).rows) ? "#f0fff4" : "#fff8f0",
-                  color: found && (yearKeys.length > 0 || (found as Record<string,unknown>).rows) ? "#276749" : "#c05621"
-                }}>
-                  {!found && "⚠ JSON не найден — убедись что вставил полный ответ ИИ включая фигурные скобки"}
-                  {found && yearKeys.length > 0 && `✓ Найдены данные за ${yearKeys.length} лет: ${yearKeys.join(", ")}`}
-                  {found && yearKeys.length === 0 && (found as Record<string,unknown>).rows && "✓ Найден формат rows — готово к применению"}
-                  {found && yearKeys.length === 0 && !(found as Record<string,unknown>).rows && `⚠ JSON найден, но годы не обнаружены (ключи: ${Object.keys(found).join(", ")})`}
-                </div>
-              );
-            })()}
-            <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-200 justify-end">
-              <span className="text-xs text-gray-400 flex-1">
-                {pasteText.length > 0 ? `${pasteText.length} символов` : ""}
-              </span>
-              <button
-                onClick={() => setPasteOpen(false)}
-                className="px-4 py-1.5 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
-              >
-                Отмена
-              </button>
-              <button
-                disabled={pasteText.trim().length === 0}
-                onClick={() => {
-                  try {
-                    applyAiJson(pasteText, fields[selectedIdx], selectedIdx);
-                    setAiError(null);
-                    setPasteOpen(false);
-                  } catch (e) {
-                    setAiError(e instanceof Error ? e.message : "Ошибка разбора");
-                    setPasteOpen(false);
-                  }
-                }}
-                className="px-4 py-1.5 text-xs rounded font-semibold disabled:opacity-40"
-                style={{ background: "#217346", color: "#fff" }}
-              >
-                Применить к таблице
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
