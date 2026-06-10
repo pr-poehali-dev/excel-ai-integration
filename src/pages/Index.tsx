@@ -1666,11 +1666,22 @@ export default function Index() {
   const [activeFileId, setActiveFileId] = useState<string | null>(() => window.__datamind_activeFileId ?? null);
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
   const [selected, setSelected] = useState<{ row: number; col: number } | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>(() => window.__datamind_messages ?? [{
+  const WELCOME_MSG: ChatMessage = {
     role: "ai",
     text: "Загрузи Excel, Word или PDF файлы. Я вижу всё содержимое и могу выполнять задания — анализировать, сверять данные, актуализировать таблицы и текст.\n\nМожно прикрепить **скриншот графика** — я пойму как его воспроизвести на твоих данных.",
     ts: getTime(),
-  }]);
+  };
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    if (window.__datamind_messages) return window.__datamind_messages;
+    try {
+      const saved = localStorage.getItem("dm_chat_messages");
+      if (saved) {
+        const parsed = JSON.parse(saved) as ChatMessage[];
+        if (parsed.length > 0) return parsed;
+      }
+    } catch { /* ignore */ }
+    return [WELCOME_MSG];
+  });
   const [aiInput, setAiInput] = useState("");
   const [pendingImages, setPendingImages] = useState<ChatImage[]>([]);
   const [aiThinking, setAiThinking] = useState(false);
@@ -1708,6 +1719,9 @@ export default function Index() {
   const [savedSessions, setSavedSessions] = useState<Pick<SavedSession, "id" | "name" | "savedAt">[]>([]);
   const [sessionSaving, setSessionSaving] = useState(false);
 
+  // Системный промпт — дебаг-модалка
+  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
+
   // Загружаем базу знаний из IndexedDB при старте (с миграцией старых записей)
   useEffect(() => {
     loadKnowledge().then(entries => {
@@ -1733,7 +1747,19 @@ export default function Index() {
   // Сохраняем в window при каждом изменении
   useEffect(() => { window.__datamind_files = files; }, [files]);
   useEffect(() => { window.__datamind_activeFileId = activeFileId; }, [activeFileId]);
-  useEffect(() => { window.__datamind_messages = messages; }, [messages]);
+  useEffect(() => {
+    window.__datamind_messages = messages;
+    // Сохраняем в localStorage — чтобы чат выживал при обновлении страницы
+    try {
+      // Берём последние 100 сообщений, без бинарных данных (images)
+      const toSave = messages.slice(-100).map(m => ({
+        role: m.role, text: m.text, ts: m.ts,
+        refs: m.refs, docText: m.docText, docName: m.docName,
+        ask_user: m.ask_user, pendingPrompt: m.pendingPrompt,
+      }));
+      localStorage.setItem("dm_chat_messages", JSON.stringify(toSave));
+    } catch { /* ignore quota errors */ }
+  }, [messages]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -2410,16 +2436,10 @@ export default function Index() {
         }));
       }
 
-      // doc_update — показываем текст прямо в чате + обновляем в state
+      // doc_update — показываем текст прямо в чате, НЕ затираем оригинал документа
       if (result.docUpdates && result.docUpdates.length > 0) {
         const upd = result.docUpdates[0];
-        // Обновляем текст документа в state чтобы при открытии тоже был новый
-        setDocs((prev) => prev.map((d) => {
-          const u = result.docUpdates!.find(x => x.docId === d.id);
-          if (!u) return d;
-          return { ...d, text: u.text, html: undefined };
-        }));
-        // Показываем текст прямо в чате с кнопкой копировать
+        // Показываем текст прямо в чате с кнопкой копировать (оригинал документа остаётся нетронутым)
         setMessages((prev) => [...prev, {
           role: "ai",
           text: result.text,
@@ -2498,6 +2518,51 @@ export default function Index() {
       {settingsOpen && (
         <SettingsModal settings={aiSettings} onChange={setAiSettings} onClose={() => setSettingsOpen(false)} />
       )}
+
+      {systemPromptOpen && (() => {
+        const knowledgeText = formatKnowledgeForAI(knowledge);
+        const activePromptsText = prompts.filter(p => p.enabled).map(p => p.text).join("\n\n");
+        const fullPrompt = [knowledgeText, activePromptsText, SYSTEM_PROMPT].filter(Boolean).join("\n\n---\n\n");
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.7)" }}
+            onClick={() => setSystemPromptOpen(false)}>
+            <div className="bg-[#1a1d23] border border-border/60 rounded-2xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl"
+              onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-border/40 flex-shrink-0">
+                <div className="flex items-center gap-2">
+                  <Icon name="ScrollText" size={16} className="text-primary" />
+                  <span className="font-semibold text-sm">Системный промпт</span>
+                  <span className="text-xs text-muted-foreground">— всё что видит ИИ перед твоим сообщением</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => { navigator.clipboard.writeText(fullPrompt); }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-secondary hover:bg-secondary/80 transition-all">
+                    <Icon name="Copy" size={12} /> Скопировать
+                  </button>
+                  <button onClick={() => setSystemPromptOpen(false)}
+                    className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-secondary transition-all text-muted-foreground hover:text-foreground">
+                    <Icon name="X" size={14} />
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto p-5">
+                <div className="space-y-3">
+                  {[
+                    { label: "База знаний", color: "text-amber-400", content: knowledgeText },
+                    { label: "Активные промпты", color: "text-primary", content: activePromptsText },
+                    { label: "Системный промпт (базовый)", color: "text-green-400", content: SYSTEM_PROMPT },
+                  ].map(({ label, color, content }) => content ? (
+                    <div key={label} className="rounded-xl border border-border/40 overflow-hidden">
+                      <div className={`px-4 py-2 text-xs font-semibold ${color} bg-secondary/40 border-b border-border/40`}>{label}</div>
+                      <pre className="px-4 py-3 text-xs text-muted-foreground whitespace-pre-wrap font-mono leading-relaxed overflow-x-auto">{content}</pre>
+                    </div>
+                  ) : null)}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── Header ── */}
       <header className="border-b border-border/60 px-4 py-3 flex items-center gap-3 flex-shrink-0"
@@ -2602,6 +2667,12 @@ export default function Index() {
               {aiSettings.apiKey ? effectiveModelLabel : "Нет ключа"}
             </span>
           </button>
+          <button onClick={() => setSystemPromptOpen(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all border border-border/40"
+            title="Посмотреть системный промпт">
+            <Icon name="ScrollText" size={14} />
+            <span className="hidden lg:inline">Системный промпт</span>
+          </button>
           <button onClick={() => setKnowledgeOpen(true)}
             className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-all border ${knowledge.some(k => k.enabled) ? "text-amber-400 border-amber-400/40 bg-amber-400/10" : "text-muted-foreground border-border/40 hover:text-foreground hover:bg-secondary"}`}
             title="База знаний проекта">
@@ -2637,15 +2708,15 @@ export default function Index() {
           </button>
           <button onClick={async () => {
             const list = await listSessions();
-            setSavedSessions(list);
+            setSavedSessions(list.filter(s => s.id !== "current"));
             setSessionOpen(true);
           }}
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all border border-border/40"
-            title="Сохранить / открыть проект">
+            title="Чаты — переключение между диалогами">
             {sessionSaving
               ? <Icon name="Loader2" size={14} className="spinner" />
-              : <Icon name="FolderOpen" size={14} />}
-            <span className="hidden sm:inline">Проект</span>
+              : <Icon name="MessageSquare" size={14} />}
+            <span className="hidden sm:inline">Чаты</span>
           </button>
           <button onClick={() => navigate("/oilfield")}
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-secondary transition-all border border-border/40"
@@ -3716,10 +3787,10 @@ export default function Index() {
             style={{ background: "hsl(220,14%,8%)" }}>
 
             <div className="px-5 py-4 border-b border-border/40 flex items-center gap-3">
-              <Icon name="FolderOpen" size={16} className="text-primary" />
+              <Icon name="MessageSquare" size={16} className="text-primary" />
               <div className="flex-1">
-                <h2 className="font-semibold text-sm text-foreground">Проект</h2>
-                <p className="text-[11px] text-muted-foreground">Сохранение и восстановление рабочей сессии</p>
+                <h2 className="font-semibold text-sm text-foreground">Чаты</h2>
+                <p className="text-[11px] text-muted-foreground">Каждый чат — отдельный контекст с файлами и историей</p>
               </div>
               <button onClick={() => setSessionOpen(false)} className="text-muted-foreground hover:text-foreground">
                 <Icon name="X" size={16} />
@@ -3727,23 +3798,23 @@ export default function Index() {
             </div>
 
             <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-3">
-              {/* Сохранить текущее */}
+              {/* Сохранить текущий чат */}
               <div className="rounded-xl border border-primary/30 p-4 space-y-2" style={{ background: "rgba(52,211,153,0.04)" }}>
-                <p className="text-xs font-semibold text-primary">Сохранить текущую сессию</p>
+                <p className="text-xs font-semibold text-primary">Сохранить текущий чат</p>
                 <p className="text-[11px] text-muted-foreground">
-                  Файлы: {files.length} Excel, {docs.length} документов · {messages.length} сообщений
+                  {files.length} Excel · {docs.length} документов · {messages.length} сообщений
                 </p>
                 <div className="flex gap-2">
-                  <input id="session-name-input" type="text" placeholder="Название сессии..."
-                    defaultValue={`Сессия ${new Date().toLocaleDateString("ru")}`}
+                  <input id="session-name-input" type="text" placeholder="Название чата..."
+                    defaultValue={`Чат ${new Date().toLocaleDateString("ru")}`}
                     className="flex-1 text-xs bg-secondary border border-border/60 text-foreground rounded-lg px-3 py-1.5 outline-none focus:border-primary/50" />
                   <button onClick={async () => {
                     const input = document.getElementById("session-name-input") as HTMLInputElement;
-                    const name = input?.value || "Сессия";
+                    const name = input?.value || "Чат";
                     const id = `session_${Date.now()}`;
                     await doSaveSession(id, name);
                     const list = await listSessions();
-                    setSavedSessions(list);
+                    setSavedSessions(list.filter(s => s.id !== "current"));
                   }} disabled={sessionSaving}
                     className="px-3 py-1.5 rounded-lg text-xs btn-primary disabled:opacity-50 flex items-center gap-1.5">
                     {sessionSaving ? <Icon name="Loader2" size={12} className="spinner" /> : <Icon name="Save" size={12} />}
@@ -3752,16 +3823,35 @@ export default function Index() {
                 </div>
               </div>
 
-              {/* Список сессий */}
-              {savedSessions.length === 0 ? (
-                <p className="text-xs text-muted-foreground text-center py-4">Нет сохранённых сессий</p>
+              {/* Новый чат */}
+              <button onClick={() => {
+                if (!window.confirm("Начать новый чат? Текущий чат и файлы будут очищены.\n\nСначала сохрани текущий чат если нужно.")) return;
+                localStorage.removeItem("dm_chat_messages");
+                setMessages([WELCOME_MSG]);
+                setFiles([]);
+                setDocs([]);
+                setActiveFileId(null);
+                setSessionOpen(false);
+              }} className="w-full flex items-center gap-3 px-4 py-3 rounded-xl border border-border/40 hover:border-primary/40 hover:bg-primary/5 transition-all text-left">
+                <div className="w-8 h-8 rounded-lg bg-primary/15 flex items-center justify-center flex-shrink-0">
+                  <Icon name="Plus" size={16} className="text-primary" />
+                </div>
+                <div>
+                  <p className="text-xs font-medium text-foreground">Новый чат</p>
+                  <p className="text-[11px] text-muted-foreground">Очистить контекст и начать с чистого листа</p>
+                </div>
+              </button>
+
+              {/* Список сохранённых чатов */}
+              {savedSessions.filter(s => s.id !== "current").length === 0 ? (
+                <p className="text-xs text-muted-foreground text-center py-4">Нет сохранённых чатов</p>
               ) : (
                 <div className="space-y-2">
-                  <p className="text-xs text-muted-foreground font-medium">Сохранённые сессии:</p>
-                  {savedSessions.map((s) => (
+                  <p className="text-xs text-muted-foreground font-medium">Сохранённые чаты:</p>
+                  {savedSessions.filter(s => s.id !== "current").map((s) => (
                     <div key={s.id} className="flex items-center gap-3 px-3 py-2.5 rounded-xl border border-border/40 hover:border-primary/30 transition-all"
                       style={{ background: "rgba(255,255,255,0.02)" }}>
-                      <Icon name="Clock" size={14} className="text-muted-foreground flex-shrink-0" />
+                      <Icon name="MessageCircle" size={14} className="text-muted-foreground flex-shrink-0" />
                       <div className="flex-1 min-w-0">
                         <p className="text-xs font-medium text-foreground truncate">{s.name}</p>
                         <p className="text-[11px] text-muted-foreground">
