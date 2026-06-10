@@ -80,22 +80,48 @@ def extract_json(raw: str) -> dict:
     return {"text": raw or "ИИ вернул пустой ответ"}
 
 
+def handle_get_upload_url(body: dict) -> dict:
+    """Возвращает presigned PUT URL для прямой загрузки файла в S3 с фронтенда."""
+    import boto3
+    from botocore.config import Config
+
+    file_name = body.get("file_name", "upload.pdf")
+    content_type = body.get("content_type", "application/pdf")
+    safe_name = "".join(c for c in file_name if c.isalnum() or c in "._-")[:80]
+    session_id = str(uuid.uuid4())[:12]
+    s3_key = f"uploads/{session_id}/{safe_name}"
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url="https://bucket.poehali.dev",
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    upload_url = s3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": "files", "Key": s3_key, "ContentType": content_type},
+        ExpiresIn=600,
+    )
+    return {
+        "statusCode": 200,
+        "headers": {**CORS, "Content-Type": "application/json"},
+        "body": json.dumps({"upload_url": upload_url, "s3_key": s3_key}),
+    }
+
+
 def handle_pdf_to_images(body: dict) -> dict:
-    """Конвертирует PDF (base64) в PNG-изображения страниц, сохраняет в S3, возвращает URL."""
+    """
+    Конвертирует PDF в PNG-изображения страниц, сохраняет в S3, возвращает URL.
+    Поддерживает два режима:
+      1. s3_key  — читает уже загруженный файл из S3 (для больших PDF)
+      2. pdf_b64 — декодирует base64 (устаревший, только малые файлы)
+    """
     import fitz  # PyMuPDF
     import boto3
 
-    pdf_b64 = body.get("pdf_b64", "")
-    if not pdf_b64:
-        return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "pdf_b64 required"})}
-
-    dpi = min(int(body.get("dpi", 150)), 200)
-    max_pages = min(int(body.get("max_pages", 50)), 100)
-
-    pdf_bytes = base64.b64decode(pdf_b64)
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pages = len(doc)
-    pages_to_render = min(total_pages, max_pages)
+    dpi = min(int(body.get("dpi", 120)), 180)
+    max_pages = min(int(body.get("max_pages", 300)), 500)
 
     s3 = boto3.client(
         "s3",
@@ -104,6 +130,23 @@ def handle_pdf_to_images(body: dict) -> dict:
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
     access_key = os.environ["AWS_ACCESS_KEY_ID"]
+
+    # Получаем байты PDF
+    s3_key = body.get("s3_key", "")
+    if s3_key:
+        # Читаем из S3 — работает для файлов любого размера
+        obj = s3.get_object(Bucket="files", Key=s3_key)
+        pdf_bytes = obj["Body"].read()
+    else:
+        pdf_b64 = body.get("pdf_b64", "")
+        if not pdf_b64:
+            return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "s3_key or pdf_b64 required"})}
+        pdf_bytes = base64.b64decode(pdf_b64)
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = len(doc)
+    pages_to_render = min(total_pages, max_pages)
+
     session_id = str(uuid.uuid4())[:8]
     matrix = fitz.Matrix(dpi / 72, dpi / 72)
     page_urls = []
@@ -118,6 +161,13 @@ def handle_pdf_to_images(body: dict) -> dict:
         page_urls.append(url)
 
     doc.close()
+
+    # Удаляем исходный загруженный файл из S3 (он больше не нужен)
+    if s3_key:
+        try:
+            s3.delete_object(Bucket="files", Key=s3_key)
+        except Exception:
+            pass
 
     return {
         "statusCode": 200,
@@ -140,6 +190,9 @@ def handler(event: dict, context) -> dict:
     body = json.loads(event.get("body") or "{}")
 
     # Роутинг по action
+    if body.get("action") == "get_upload_url":
+        return handle_get_upload_url(body)
+
     if body.get("action") == "pdf_to_images":
         return handle_pdf_to_images(body)
 

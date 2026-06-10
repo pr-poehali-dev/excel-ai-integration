@@ -1925,18 +1925,29 @@ export default function Index() {
     }]);
 
     try {
-      const buf = await file.arrayBuffer();
-      const bytes = new Uint8Array(buf);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      const pdf_b64 = btoa(binary);
+      // Шаг 1: получить presigned URL
+      const urlResp = await fetch(AI_EXCEL_URL, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "get_upload_url", file_name: file.name, content_type: "application/pdf" }),
+      });
+      const { upload_url, s3_key } = await urlResp.json() as { upload_url: string; s3_key: string };
 
+      // Шаг 2: загрузить файл напрямую в S3 (без лимита размера)
+      await fetch(upload_url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/pdf" },
+        body: file,
+      });
+
+      // Шаг 3: бэкенд конвертирует из S3 в картинки
       const resp = await fetch(AI_EXCEL_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "pdf_to_images", pdf_b64, dpi: 150, max_pages: 80 }),
+        body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
       });
-      const result = await resp.json() as { page_urls: string[]; total_pages: number; rendered_pages: number };
+      const result = await resp.json() as { page_urls: string[]; total_pages: number; rendered_pages: number; error?: string };
+
+      if (result.error) throw new Error(result.error);
 
       setDocs(prev => prev.map(d => d.id !== id ? d : {
         ...d,
@@ -3094,32 +3105,50 @@ export default function Index() {
             const sourceType: KnowledgeSourceType = isPdf ? "pdf" : isDocx ? "docx" : "excel";
 
             if (isPdf) {
-              // PDF → конвертируем через бэкенд
+              // PDF → загружаем напрямую в S3 (любой размер), затем бэкенд читает оттуда
               setKbLoadingId(id);
               const placeholder: KnowledgeEntry = {
                 id, title, content: "Загрузка...", category: "docs",
                 sourceType: "pdf", enabled: false, updatedAt: Date.now(), fileName: f.name,
               };
-              const updatedPlaceholder = [...knowledge, placeholder];
-              setKnowledge(updatedPlaceholder);
+              setKnowledge(prev => [...prev, placeholder]);
 
-              const buf = await f.arrayBuffer();
-              const bytes = new Uint8Array(buf);
-              let binary = "";
-              for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-              const pdf_b64 = btoa(binary);
-              const resp = await fetch(AI_EXCEL_URL, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: "pdf_to_images", pdf_b64, dpi: 150, max_pages: 80 }),
-              });
-              const result = await resp.json() as { page_urls: string[]; total_pages: number };
-              const entry: KnowledgeEntry = {
-                id, title, content: `PDF «${f.name}»: ${result.total_pages} стр. Передаётся ИИ как изображения страниц.`,
-                category: "docs", sourceType: "pdf", enabled: true, updatedAt: Date.now(),
-                fileName: f.name, pageImageUrls: result.page_urls, pageCount: result.total_pages,
-              };
-              const updated = knowledge.filter(k => k.id !== id).concat(entry);
-              setKnowledge(updated); await saveKnowledge(updated);
+              try {
+                // Шаг 1: получить presigned URL для загрузки в S3
+                const urlResp = await fetch(AI_EXCEL_URL, {
+                  method: "POST", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ action: "get_upload_url", file_name: f.name, content_type: "application/pdf" }),
+                });
+                const { upload_url, s3_key } = await urlResp.json() as { upload_url: string; s3_key: string };
+
+                // Шаг 2: залить PDF напрямую в S3 (без лимита размера)
+                await fetch(upload_url, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/pdf" },
+                  body: f,
+                });
+
+                // Шаг 3: бэкенд читает из S3 и конвертирует в картинки
+                const resp = await fetch(AI_EXCEL_URL, {
+                  method: "POST", headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
+                });
+                const result = await resp.json() as { page_urls: string[]; total_pages: number; error?: string };
+
+                if (result.error) throw new Error(result.error);
+
+                const entry: KnowledgeEntry = {
+                  id, title,
+                  content: `PDF «${f.name}»: ${result.total_pages} стр. Передаётся ИИ как изображения страниц.`,
+                  category: "docs", sourceType: "pdf", enabled: true, updatedAt: Date.now(),
+                  fileName: f.name, pageImageUrls: result.page_urls, pageCount: result.total_pages,
+                };
+                setKnowledge(prev => { const updated = prev.filter(k => k.id !== id).concat(entry); saveKnowledge(updated); return updated; });
+              } catch (err) {
+                const errMsg = err instanceof Error ? err.message : "Ошибка загрузки PDF";
+                setKnowledge(prev => prev.filter(k => k.id !== id));
+                setNotice({ type: "err", text: `Не удалось загрузить PDF: ${errMsg}` });
+              }
               setKbLoadingId(null);
 
             } else if (isDocx) {
