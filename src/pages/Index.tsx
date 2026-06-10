@@ -1695,6 +1695,8 @@ export default function Index() {
   const [editingKbId, setEditingKbId] = useState<string | null>(null);
   const [kbCategoryFilter, setKbCategoryFilter] = useState<KnowledgeCategory | "all">("all");
   const [kbLoadingId, setKbLoadingId] = useState<string | null>(null);
+  const [kbLoadingProgress, setKbLoadingProgress] = useState<{ step: string; pct: number } | null>(null);
+  const kbAbortRef = useRef<AbortController | null>(null);
 
   // Сессия
   const [sessionOpen, setSessionOpen] = useState(false);
@@ -3105,8 +3107,11 @@ export default function Index() {
             const sourceType: KnowledgeSourceType = isPdf ? "pdf" : isDocx ? "docx" : "excel";
 
             if (isPdf) {
-              // PDF → загружаем напрямую в S3 (любой размер), затем бэкенд читает оттуда
+              // PDF → загружаем напрямую в S3 (любой размер), затем бэкенд конвертирует
+              const abort = new AbortController();
+              kbAbortRef.current = abort;
               setKbLoadingId(id);
+              setKbLoadingProgress({ step: "Подготовка...", pct: 0 });
               const placeholder: KnowledgeEntry = {
                 id, title, content: "Загрузка...", category: "docs",
                 sourceType: "pdf", enabled: false, updatedAt: Date.now(), fileName: f.name,
@@ -3114,27 +3119,42 @@ export default function Index() {
               setKnowledge(prev => [...prev, placeholder]);
 
               try {
-                // Шаг 1: получить presigned URL для загрузки в S3
+                // Шаг 1: получить presigned URL
+                setKbLoadingProgress({ step: "Получаю адрес загрузки...", pct: 5 });
                 const urlResp = await fetch(AI_EXCEL_URL, {
                   method: "POST", headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ action: "get_upload_url", file_name: f.name, content_type: "application/pdf" }),
+                  signal: abort.signal,
                 });
                 const { upload_url, s3_key } = await urlResp.json() as { upload_url: string; s3_key: string };
 
-                // Шаг 2: залить PDF напрямую в S3 (без лимита размера)
-                await fetch(upload_url, {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/pdf" },
-                  body: f,
+                // Шаг 2: загрузить в S3 — с отслеживанием прогресса через XHR
+                setKbLoadingProgress({ step: `Загружаю файл (${(f.size / 1024 / 1024).toFixed(1)} МБ)...`, pct: 10 });
+                await new Promise<void>((resolve, reject) => {
+                  const xhr = new XMLHttpRequest();
+                  abort.signal.addEventListener("abort", () => { xhr.abort(); reject(new Error("Отменено")); });
+                  xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                      const pct = Math.round(10 + (e.loaded / e.total) * 50);
+                      setKbLoadingProgress({ step: `Загружаю файл... ${Math.round(e.loaded / e.total * 100)}%`, pct });
+                    }
+                  };
+                  xhr.onload = () => xhr.status < 300 ? resolve() : reject(new Error(`Ошибка загрузки: ${xhr.status}`));
+                  xhr.onerror = () => reject(new Error("Ошибка сети"));
+                  xhr.open("PUT", upload_url);
+                  xhr.setRequestHeader("Content-Type", "application/pdf");
+                  xhr.send(f);
                 });
 
-                // Шаг 3: бэкенд читает из S3 и конвертирует в картинки
+                // Шаг 3: конвертация в картинки
+                setKbLoadingProgress({ step: "Конвертирую страницы в изображения...", pct: 65 });
                 const resp = await fetch(AI_EXCEL_URL, {
                   method: "POST", headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
+                  signal: abort.signal,
                 });
+                setKbLoadingProgress({ step: "Сохраняю результат...", pct: 90 });
                 const result = await resp.json() as { page_urls: string[]; total_pages: number; error?: string };
-
                 if (result.error) throw new Error(result.error);
 
                 const entry: KnowledgeEntry = {
@@ -3143,13 +3163,20 @@ export default function Index() {
                   category: "docs", sourceType: "pdf", enabled: true, updatedAt: Date.now(),
                   fileName: f.name, pageImageUrls: result.page_urls, pageCount: result.total_pages,
                 };
+                setKbLoadingProgress({ step: "Готово!", pct: 100 });
                 setKnowledge(prev => { const updated = prev.filter(k => k.id !== id).concat(entry); saveKnowledge(updated); return updated; });
               } catch (err) {
                 const errMsg = err instanceof Error ? err.message : "Ошибка загрузки PDF";
-                setKnowledge(prev => prev.filter(k => k.id !== id));
-                setNotice({ type: "err", text: `Не удалось загрузить PDF: ${errMsg}` });
+                if (errMsg !== "Отменено") {
+                  setKnowledge(prev => prev.filter(k => k.id !== id));
+                  setNotice({ type: "err", text: `Не удалось загрузить PDF: ${errMsg}` });
+                } else {
+                  setKnowledge(prev => prev.filter(k => k.id !== id));
+                }
               }
+              kbAbortRef.current = null;
               setKbLoadingId(null);
+              setKbLoadingProgress(null);
 
             } else if (isDocx) {
               const buf = await f.arrayBuffer();
@@ -3449,16 +3476,112 @@ export default function Index() {
 
                           {/* Категория (select при редактировании) */}
                           {editingKbId === k.id && (
-                            <select value={k.category ?? "custom"}
-                              onChange={async (e) => {
-                                const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, category: e.target.value as KnowledgeCategory } : kk);
-                                setKnowledge(updated); await saveKnowledge(updated);
-                              }}
-                              className="mb-1.5 text-[11px] bg-secondary border border-border/60 text-foreground rounded px-2 py-0.5 outline-none">
-                              {(Object.entries(KNOWLEDGE_CATEGORIES) as [KnowledgeCategory, typeof KNOWLEDGE_CATEGORIES[KnowledgeCategory]][]).map(([cat, meta]) => (
-                                <option key={cat} value={cat}>{meta.label}</option>
-                              ))}
-                            </select>
+                            <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                              <select value={k.category ?? "custom"}
+                                onChange={async (e) => {
+                                  const updated = knowledge.map(kk => kk.id === k.id ? { ...kk, category: e.target.value as KnowledgeCategory } : kk);
+                                  setKnowledge(updated); await saveKnowledge(updated);
+                                }}
+                                className="text-[11px] bg-secondary border border-border/60 text-foreground rounded px-2 py-0.5 outline-none">
+                                {(Object.entries(KNOWLEDGE_CATEGORIES) as [KnowledgeCategory, typeof KNOWLEDGE_CATEGORIES[KnowledgeCategory]][]).map(([cat, meta]) => (
+                                  <option key={cat} value={cat}>{meta.label}</option>
+                                ))}
+                              </select>
+                              {/* Кнопка загрузки файла прямо в это правило */}
+                              {!isLoading && (
+                                <label className="flex items-center gap-1 px-2 py-0.5 rounded border border-border/50 text-[11px] text-muted-foreground hover:text-amber-300 hover:border-amber-400/40 cursor-pointer transition-all">
+                                  <Icon name="Upload" size={11} />
+                                  Загрузить PDF / DOCX
+                                  <input type="file" accept=".pdf,.docx" className="hidden"
+                                    onChange={async (e) => {
+                                      const file = e.target.files?.[0];
+                                      if (!file) return;
+                                      e.target.value = "";
+                                      const isPdfFile = file.name.match(/\.pdf$/i);
+                                      const isDocxFile = file.name.match(/\.docx$/i);
+                                      if (isPdfFile) {
+                                        // Загружаем PDF в это конкретное правило
+                                        const abort = new AbortController();
+                                        kbAbortRef.current = abort;
+                                        setKbLoadingId(k.id);
+                                        setKbLoadingProgress({ step: "Получаю адрес загрузки...", pct: 5 });
+                                        try {
+                                          const urlResp = await fetch(AI_EXCEL_URL, {
+                                            method: "POST", headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ action: "get_upload_url", file_name: file.name, content_type: "application/pdf" }),
+                                            signal: abort.signal,
+                                          });
+                                          const { upload_url, s3_key } = await urlResp.json() as { upload_url: string; s3_key: string };
+                                          setKbLoadingProgress({ step: `Загружаю файл (${(file.size / 1024 / 1024).toFixed(1)} МБ)...`, pct: 10 });
+                                          await new Promise<void>((resolve, reject) => {
+                                            const xhr = new XMLHttpRequest();
+                                            abort.signal.addEventListener("abort", () => { xhr.abort(); reject(new Error("Отменено")); });
+                                            xhr.upload.onprogress = (ev) => {
+                                              if (ev.lengthComputable) setKbLoadingProgress({ step: `Загружаю файл... ${Math.round(ev.loaded / ev.total * 100)}%`, pct: Math.round(10 + (ev.loaded / ev.total) * 50) });
+                                            };
+                                            xhr.onload = () => xhr.status < 300 ? resolve() : reject(new Error(`Ошибка: ${xhr.status}`));
+                                            xhr.onerror = () => reject(new Error("Ошибка сети"));
+                                            xhr.open("PUT", upload_url);
+                                            xhr.setRequestHeader("Content-Type", "application/pdf");
+                                            xhr.send(file);
+                                          });
+                                          setKbLoadingProgress({ step: "Конвертирую страницы...", pct: 65 });
+                                          const resp = await fetch(AI_EXCEL_URL, {
+                                            method: "POST", headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
+                                            signal: abort.signal,
+                                          });
+                                          const result = await resp.json() as { page_urls: string[]; total_pages: number; error?: string };
+                                          if (result.error) throw new Error(result.error);
+                                          setKbLoadingProgress({ step: "Готово!", pct: 100 });
+                                          const updated = knowledge.map(kk => kk.id === k.id ? {
+                                            ...kk, sourceType: "pdf" as KnowledgeSourceType, enabled: true,
+                                            content: `PDF «${file.name}»: ${result.total_pages} стр.`,
+                                            fileName: file.name, pageImageUrls: result.page_urls, pageCount: result.total_pages, updatedAt: Date.now(),
+                                          } : kk);
+                                          setKnowledge(updated); await saveKnowledge(updated);
+                                        } catch (err) {
+                                          const msg = err instanceof Error ? err.message : "Ошибка";
+                                          if (msg !== "Отменено") setNotice({ type: "err", text: `Ошибка загрузки: ${msg}` });
+                                        }
+                                        kbAbortRef.current = null;
+                                        setKbLoadingId(null);
+                                        setKbLoadingProgress(null);
+                                      } else if (isDocxFile) {
+                                        const buf = await file.arrayBuffer();
+                                        const textResult = await mammoth.extractRawText({ arrayBuffer: buf });
+                                        const updated = knowledge.map(kk => kk.id === k.id ? {
+                                          ...kk, sourceType: "docx" as KnowledgeSourceType, enabled: true,
+                                          content: textResult.value, fileName: file.name, updatedAt: Date.now(),
+                                        } : kk);
+                                        setKnowledge(updated); await saveKnowledge(updated);
+                                      }
+                                    }}
+                                  />
+                                </label>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Прогресс загрузки */}
+                          {isLoading && kbLoadingProgress && (
+                            <div className="mt-1.5 mb-1 space-y-1.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-[11px] text-amber-300 flex items-center gap-1.5">
+                                  <Icon name="Loader2" size={11} className="spinner" />
+                                  {kbLoadingProgress.step}
+                                </span>
+                                <button
+                                  onClick={() => { kbAbortRef.current?.abort(); }}
+                                  className="text-[10px] text-red-400 hover:text-red-300 flex items-center gap-1 px-1.5 py-0.5 rounded border border-red-400/30 hover:border-red-400/60 transition-all">
+                                  <Icon name="X" size={9} /> Отменить
+                                </button>
+                              </div>
+                              <div className="w-full h-1.5 rounded-full bg-secondary overflow-hidden">
+                                <div className="h-full rounded-full bg-amber-400 transition-all duration-300"
+                                  style={{ width: `${kbLoadingProgress.pct}%` }} />
+                              </div>
+                            </div>
                           )}
 
                           {/* Содержимое */}
