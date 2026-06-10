@@ -80,34 +80,86 @@ def extract_json(raw: str) -> dict:
     return {"text": raw or "ИИ вернул пустой ответ"}
 
 
-def handle_get_upload_url(body: dict) -> dict:
-    """Возвращает presigned PUT URL для прямой загрузки файла в S3 с фронтенда."""
+def get_s3():
     import boto3
-    from botocore.config import Config
-
-    file_name = body.get("file_name", "upload.pdf")
-    content_type = body.get("content_type", "application/pdf")
-    safe_name = "".join(c for c in file_name if c.isalnum() or c in "._-")[:80]
-    session_id = str(uuid.uuid4())[:12]
-    s3_key = f"uploads/{session_id}/{safe_name}"
-
-    s3 = boto3.client(
+    return boto3.client(
         "s3",
         endpoint_url="https://bucket.poehali.dev",
         aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
-    upload_url = s3.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": "files", "Key": s3_key, "ContentType": content_type},
-        ExpiresIn=600,
+
+
+def handle_upload_init(body: dict) -> dict:
+    """Инициирует multipart upload, возвращает upload_id и s3_key."""
+    file_name = body.get("file_name", "upload.pdf")
+    safe_name = "".join(c for c in file_name if c.isalnum() or c in "._-")[:80]
+    session_id = str(uuid.uuid4())[:12]
+    s3_key = f"uploads/{session_id}/{safe_name}"
+
+    s3 = get_s3()
+    resp = s3.create_multipart_upload(Bucket="files", Key=s3_key, ContentType="application/pdf")
+    return {
+        "statusCode": 200,
+        "headers": {**CORS, "Content-Type": "application/json"},
+        "body": json.dumps({"upload_id": resp["UploadId"], "s3_key": s3_key}),
+    }
+
+
+def handle_upload_chunk(body: dict) -> dict:
+    """Загружает один чанк (base64) как часть multipart upload."""
+    s3_key = body.get("s3_key", "")
+    upload_id = body.get("upload_id", "")
+    part_number = int(body.get("part_number", 1))  # 1-based
+    chunk_b64 = body.get("chunk_b64", "")
+
+    if not all([s3_key, upload_id, chunk_b64]):
+        return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "missing fields"})}
+
+    chunk_bytes = base64.b64decode(chunk_b64)
+    s3 = get_s3()
+    resp = s3.upload_part(
+        Bucket="files", Key=s3_key,
+        UploadId=upload_id, PartNumber=part_number, Body=chunk_bytes,
     )
     return {
         "statusCode": 200,
         "headers": {**CORS, "Content-Type": "application/json"},
-        "body": json.dumps({"upload_url": upload_url, "s3_key": s3_key}),
+        "body": json.dumps({"etag": resp["ETag"], "part_number": part_number}),
     }
+
+
+def handle_upload_complete(body: dict) -> dict:
+    """Завершает multipart upload, возвращает итоговый s3_key."""
+    s3_key = body.get("s3_key", "")
+    upload_id = body.get("upload_id", "")
+    parts = body.get("parts", [])  # [{part_number, etag}, ...]
+
+    if not all([s3_key, upload_id, parts]):
+        return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "missing fields"})}
+
+    s3 = get_s3()
+    s3.complete_multipart_upload(
+        Bucket="files", Key=s3_key, UploadId=upload_id,
+        MultipartUpload={"Parts": [{"PartNumber": p["part_number"], "ETag": p["etag"]} for p in parts]},
+    )
+    return {
+        "statusCode": 200,
+        "headers": {**CORS, "Content-Type": "application/json"},
+        "body": json.dumps({"s3_key": s3_key, "ok": True}),
+    }
+
+
+def handle_upload_abort(body: dict) -> dict:
+    """Отменяет незавершённый multipart upload."""
+    s3_key = body.get("s3_key", "")
+    upload_id = body.get("upload_id", "")
+    if s3_key and upload_id:
+        try:
+            get_s3().abort_multipart_upload(Bucket="files", Key=s3_key, UploadId=upload_id)
+        except Exception:
+            pass
+    return {"statusCode": 200, "headers": {**CORS}, "body": json.dumps({"ok": True})}
 
 
 def handle_pdf_to_images(body: dict) -> dict:
@@ -190,10 +242,16 @@ def handler(event: dict, context) -> dict:
     body = json.loads(event.get("body") or "{}")
 
     # Роутинг по action
-    if body.get("action") == "get_upload_url":
-        return handle_get_upload_url(body)
-
-    if body.get("action") == "pdf_to_images":
+    action = body.get("action", "")
+    if action == "upload_init":
+        return handle_upload_init(body)
+    if action == "upload_chunk":
+        return handle_upload_chunk(body)
+    if action == "upload_complete":
+        return handle_upload_complete(body)
+    if action == "upload_abort":
+        return handle_upload_abort(body)
+    if action == "pdf_to_images":
         return handle_pdf_to_images(body)
 
     # ── Основная логика: ИИ по Excel ──

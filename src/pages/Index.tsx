@@ -1911,6 +1911,62 @@ export default function Index() {
     reader.readAsArrayBuffer(file);
   }, []);
 
+  // ── Универсальная чанковая загрузка PDF через наш бэкенд (без CORS/presigned) ──
+  const uploadPdfChunked = async (
+    file: File,
+    onProgress: (step: string, pct: number) => void,
+    signal: AbortSignal
+  ): Promise<string> => {
+    const CHUNK = 512 * 1024; // 512 KB на чанк
+    const totalChunks = Math.ceil(file.size / CHUNK);
+
+    // 1. Инициируем multipart upload
+    onProgress("Инициирую загрузку...", 2);
+    const initResp = await fetch(AI_EXCEL_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "upload_init", file_name: file.name }),
+      signal,
+    });
+    const { upload_id, s3_key } = await initResp.json() as { upload_id: string; s3_key: string };
+
+    // 2. Шлём чанки
+    const parts: { part_number: number; etag: string }[] = [];
+    for (let i = 0; i < totalChunks; i++) {
+      if (signal.aborted) throw new Error("Отменено");
+      const chunk = file.slice(i * CHUNK, (i + 1) * CHUNK);
+      const buf = await chunk.arrayBuffer();
+      // Быстрый btoa через Uint8Array
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      for (let b = 0; b < bytes.length; b++) binary += String.fromCharCode(bytes[b]);
+      const chunk_b64 = btoa(binary);
+
+      const pct = Math.round(5 + ((i + 1) / totalChunks) * 70);
+      onProgress(`Загружаю... ${i + 1}/${totalChunks} (${Math.round(file.size / 1024 / 1024 * (i + 1) / totalChunks * 10) / 10} МБ)`, pct);
+
+      const chunkResp = await fetch(AI_EXCEL_URL, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "upload_chunk", s3_key, upload_id, part_number: i + 1, chunk_b64 }),
+        signal,
+      });
+      const chunkResult = await chunkResp.json() as { etag: string; error?: string };
+      if (chunkResult.error) throw new Error(chunkResult.error);
+      parts.push({ part_number: i + 1, etag: chunkResult.etag });
+    }
+
+    // 3. Завершаем upload
+    onProgress("Завершаю загрузку...", 78);
+    if (signal.aborted) throw new Error("Отменено");
+    const completeResp = await fetch(AI_EXCEL_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "upload_complete", s3_key, upload_id, parts }),
+      signal,
+    });
+    const completeResult = await completeResp.json() as { ok: boolean; error?: string };
+    if (!completeResult.ok) throw new Error(completeResult.error ?? "Ошибка завершения");
+    return s3_key;
+  };
+
   // ── Load PDF → бэкенд рендерит страницы в PNG, модель видит как картинки ──
   const loadPdf = useCallback(async (file: File) => {
     const id = crypto.randomUUID();
@@ -1926,34 +1982,26 @@ export default function Index() {
       ts: getTime(),
     }]);
 
+    const abort = new AbortController();
     try {
-      // Шаг 1: получить presigned URL
-      const urlResp = await fetch(AI_EXCEL_URL, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "get_upload_url", file_name: file.name, content_type: "application/pdf" }),
-      });
-      const { upload_url, s3_key } = await urlResp.json() as { upload_url: string; s3_key: string };
+      // Загружаем чанками через бэкенд
+      const s3_key = await uploadPdfChunked(
+        file,
+        (_step, _pct) => { /* статус в messages уже есть */ },
+        abort.signal
+      );
 
-      // Шаг 2: загрузить файл напрямую в S3 (без лимита размера)
-      await fetch(upload_url, {
-        method: "PUT",
-        headers: { "Content-Type": "application/pdf" },
-        body: file,
-      });
-
-      // Шаг 3: бэкенд конвертирует из S3 в картинки
+      // Конвертируем в картинки
       const resp = await fetch(AI_EXCEL_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
+        signal: abort.signal,
       });
       const result = await resp.json() as { page_urls: string[]; total_pages: number; rendered_pages: number; error?: string };
-
       if (result.error) throw new Error(result.error);
 
       setDocs(prev => prev.map(d => d.id !== id ? d : {
-        ...d,
-        loading: false,
+        ...d, loading: false,
         pageCount: result.total_pages,
         pageImageUrls: result.page_urls,
         text: `PDF «${file.name}»: ${result.total_pages} страниц`,
@@ -3119,44 +3167,20 @@ export default function Index() {
               setKnowledge(prev => [...prev, placeholder]);
 
               try {
-                // Шаг 1: получить presigned URL
-                setKbLoadingProgress({ step: "Получаю адрес загрузки...", pct: 5 });
-                const urlResp = await fetch(AI_EXCEL_URL, {
-                  method: "POST", headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ action: "get_upload_url", file_name: f.name, content_type: "application/pdf" }),
-                  signal: abort.signal,
-                });
-                const { upload_url, s3_key } = await urlResp.json() as { upload_url: string; s3_key: string };
-
-                // Шаг 2: загрузить в S3 — с отслеживанием прогресса через XHR
-                setKbLoadingProgress({ step: `Загружаю файл (${(f.size / 1024 / 1024).toFixed(1)} МБ)...`, pct: 10 });
-                await new Promise<void>((resolve, reject) => {
-                  const xhr = new XMLHttpRequest();
-                  abort.signal.addEventListener("abort", () => { xhr.abort(); reject(new Error("Отменено")); });
-                  xhr.upload.onprogress = (e) => {
-                    if (e.lengthComputable) {
-                      const pct = Math.round(10 + (e.loaded / e.total) * 50);
-                      setKbLoadingProgress({ step: `Загружаю файл... ${Math.round(e.loaded / e.total * 100)}%`, pct });
-                    }
-                  };
-                  xhr.onload = () => xhr.status < 300 ? resolve() : reject(new Error(`Ошибка загрузки: ${xhr.status}`));
-                  xhr.onerror = () => reject(new Error("Ошибка сети"));
-                  xhr.open("PUT", upload_url);
-                  xhr.setRequestHeader("Content-Type", "application/pdf");
-                  xhr.send(f);
-                });
-
-                // Шаг 3: конвертация в картинки
-                setKbLoadingProgress({ step: "Конвертирую страницы в изображения...", pct: 65 });
+                const s3_key = await uploadPdfChunked(
+                  f,
+                  (step, pct) => setKbLoadingProgress({ step, pct }),
+                  abort.signal
+                );
+                setKbLoadingProgress({ step: "Конвертирую страницы...", pct: 80 });
                 const resp = await fetch(AI_EXCEL_URL, {
                   method: "POST", headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
                   signal: abort.signal,
                 });
-                setKbLoadingProgress({ step: "Сохраняю результат...", pct: 90 });
+                setKbLoadingProgress({ step: "Сохраняю...", pct: 95 });
                 const result = await resp.json() as { page_urls: string[]; total_pages: number; error?: string };
                 if (result.error) throw new Error(result.error);
-
                 const entry: KnowledgeEntry = {
                   id, title,
                   content: `PDF «${f.name}»: ${result.total_pages} стр. Передаётся ИИ как изображения страниц.`,
@@ -3166,13 +3190,9 @@ export default function Index() {
                 setKbLoadingProgress({ step: "Готово!", pct: 100 });
                 setKnowledge(prev => { const updated = prev.filter(k => k.id !== id).concat(entry); saveKnowledge(updated); return updated; });
               } catch (err) {
-                const errMsg = err instanceof Error ? err.message : "Ошибка загрузки PDF";
-                if (errMsg !== "Отменено") {
-                  setKnowledge(prev => prev.filter(k => k.id !== id));
-                  setNotice({ type: "err", text: `Не удалось загрузить PDF: ${errMsg}` });
-                } else {
-                  setKnowledge(prev => prev.filter(k => k.id !== id));
-                }
+                const errMsg = err instanceof Error ? err.message : "Ошибка";
+                setKnowledge(prev => prev.filter(k => k.id !== id));
+                if (errMsg !== "Отменено") setNotice({ type: "err", text: `Не удалось загрузить PDF: ${errMsg}` });
               }
               kbAbortRef.current = null;
               setKbLoadingId(null);
@@ -3500,32 +3520,17 @@ export default function Index() {
                                       const isPdfFile = file.name.match(/\.pdf$/i);
                                       const isDocxFile = file.name.match(/\.docx$/i);
                                       if (isPdfFile) {
-                                        // Загружаем PDF в это конкретное правило
                                         const abort = new AbortController();
                                         kbAbortRef.current = abort;
                                         setKbLoadingId(k.id);
-                                        setKbLoadingProgress({ step: "Получаю адрес загрузки...", pct: 5 });
+                                        setKbLoadingProgress({ step: "Начинаю загрузку...", pct: 2 });
                                         try {
-                                          const urlResp = await fetch(AI_EXCEL_URL, {
-                                            method: "POST", headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({ action: "get_upload_url", file_name: file.name, content_type: "application/pdf" }),
-                                            signal: abort.signal,
-                                          });
-                                          const { upload_url, s3_key } = await urlResp.json() as { upload_url: string; s3_key: string };
-                                          setKbLoadingProgress({ step: `Загружаю файл (${(file.size / 1024 / 1024).toFixed(1)} МБ)...`, pct: 10 });
-                                          await new Promise<void>((resolve, reject) => {
-                                            const xhr = new XMLHttpRequest();
-                                            abort.signal.addEventListener("abort", () => { xhr.abort(); reject(new Error("Отменено")); });
-                                            xhr.upload.onprogress = (ev) => {
-                                              if (ev.lengthComputable) setKbLoadingProgress({ step: `Загружаю файл... ${Math.round(ev.loaded / ev.total * 100)}%`, pct: Math.round(10 + (ev.loaded / ev.total) * 50) });
-                                            };
-                                            xhr.onload = () => xhr.status < 300 ? resolve() : reject(new Error(`Ошибка: ${xhr.status}`));
-                                            xhr.onerror = () => reject(new Error("Ошибка сети"));
-                                            xhr.open("PUT", upload_url);
-                                            xhr.setRequestHeader("Content-Type", "application/pdf");
-                                            xhr.send(file);
-                                          });
-                                          setKbLoadingProgress({ step: "Конвертирую страницы...", pct: 65 });
+                                          const s3_key = await uploadPdfChunked(
+                                            file,
+                                            (step, pct) => setKbLoadingProgress({ step, pct }),
+                                            abort.signal
+                                          );
+                                          setKbLoadingProgress({ step: "Конвертирую страницы...", pct: 80 });
                                           const resp = await fetch(AI_EXCEL_URL, {
                                             method: "POST", headers: { "Content-Type": "application/json" },
                                             body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
