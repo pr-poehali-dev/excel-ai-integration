@@ -91,58 +91,66 @@ def get_s3():
 
 
 def handle_upload_init(body: dict) -> dict:
-    """Инициирует multipart upload, возвращает upload_id и s3_key."""
+    """Создаёт временный файл в /tmp для накопления чанков."""
     file_name = body.get("file_name", "upload.pdf")
     safe_name = "".join(c for c in file_name if c.isalnum() or c in "._-")[:80]
     session_id = str(uuid.uuid4())[:12]
     s3_key = f"uploads/{session_id}/{safe_name}"
-
-    s3 = get_s3()
-    resp = s3.create_multipart_upload(Bucket="files", Key=s3_key, ContentType="application/pdf")
+    upload_id = session_id  # используем session_id как upload_id
+    tmp_path = f"/tmp/upload_{upload_id}.bin"
+    # Создаём пустой файл
+    open(tmp_path, "wb").close()
     return {
         "statusCode": 200,
         "headers": {**CORS, "Content-Type": "application/json"},
-        "body": json.dumps({"upload_id": resp["UploadId"], "s3_key": s3_key}),
+        "body": json.dumps({"upload_id": upload_id, "s3_key": s3_key}),
     }
 
 
 def handle_upload_chunk(body: dict) -> dict:
-    """Загружает один чанк (base64) как часть multipart upload."""
-    s3_key = body.get("s3_key", "")
+    """Дописывает чанк в /tmp файл."""
     upload_id = body.get("upload_id", "")
-    part_number = int(body.get("part_number", 1))  # 1-based
     chunk_b64 = body.get("chunk_b64", "")
+    part_number = int(body.get("part_number", 1))
 
-    if not all([s3_key, upload_id, chunk_b64]):
+    if not upload_id or not chunk_b64:
         return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "missing fields"})}
 
+    tmp_path = f"/tmp/upload_{upload_id}.bin"
     chunk_bytes = base64.b64decode(chunk_b64)
-    s3 = get_s3()
-    resp = s3.upload_part(
-        Bucket="files", Key=s3_key,
-        UploadId=upload_id, PartNumber=part_number, Body=chunk_bytes,
-    )
+    with open(tmp_path, "ab") as f:
+        f.write(chunk_bytes)
+
     return {
         "statusCode": 200,
         "headers": {**CORS, "Content-Type": "application/json"},
-        "body": json.dumps({"etag": resp["ETag"], "part_number": part_number}),
+        "body": json.dumps({"etag": f"part_{part_number}", "part_number": part_number}),
     }
 
 
 def handle_upload_complete(body: dict) -> dict:
-    """Завершает multipart upload, возвращает итоговый s3_key."""
+    """Читает накопленный файл из /tmp и загружает в S3 одним put_object."""
     s3_key = body.get("s3_key", "")
     upload_id = body.get("upload_id", "")
-    parts = body.get("parts", [])  # [{part_number, etag}, ...]
 
-    if not all([s3_key, upload_id, parts]):
+    if not s3_key or not upload_id:
         return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "missing fields"})}
 
-    s3 = get_s3()
-    s3.complete_multipart_upload(
-        Bucket="files", Key=s3_key, UploadId=upload_id,
-        MultipartUpload={"Parts": [{"PartNumber": p["part_number"], "ETag": p["etag"]} for p in parts]},
-    )
+    tmp_path = f"/tmp/upload_{upload_id}.bin"
+    try:
+        with open(tmp_path, "rb") as f:
+            pdf_bytes = f.read()
+    except FileNotFoundError:
+        return {"statusCode": 400, "headers": {**CORS}, "body": json.dumps({"error": "upload session not found"})}
+
+    get_s3().put_object(Bucket="files", Key=s3_key, Body=pdf_bytes, ContentType="application/pdf")
+
+    try:
+        import os as _os
+        _os.remove(tmp_path)
+    except Exception:
+        pass
+
     return {
         "statusCode": 200,
         "headers": {**CORS, "Content-Type": "application/json"},
@@ -151,12 +159,12 @@ def handle_upload_complete(body: dict) -> dict:
 
 
 def handle_upload_abort(body: dict) -> dict:
-    """Отменяет незавершённый multipart upload."""
-    s3_key = body.get("s3_key", "")
+    """Удаляет временный файл из /tmp."""
     upload_id = body.get("upload_id", "")
-    if s3_key and upload_id:
+    if upload_id:
         try:
-            get_s3().abort_multipart_upload(Bucket="files", Key=s3_key, UploadId=upload_id)
+            import os as _os
+            _os.remove(f"/tmp/upload_{upload_id}.bin")
         except Exception:
             pass
     return {"statusCode": 200, "headers": {**CORS}, "body": json.dumps({"ok": True})}
