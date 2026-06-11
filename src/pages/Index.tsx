@@ -2046,16 +2046,17 @@ export default function Index() {
       });
       const result = await resp.json() as { page_urls: string[]; total_pages: number; rendered_pages: number; error?: string };
       if (result.error) throw new Error(result.error);
+      const pageCount = result.total_pages ?? result.rendered_pages ?? result.page_urls?.length ?? 0;
 
       setDocs(prev => prev.map(d => d.id !== id ? d : {
         ...d, loading: false,
-        pageCount: result.total_pages,
+        pageCount,
         pageImageUrls: result.page_urls,
-        text: `PDF «${file.name}»: ${result.total_pages} страниц`,
+        text: `PDF «${file.name}»: ${pageCount} страниц`,
       }));
       setMessages(prev => [...prev, {
         role: "ai",
-        text: `PDF **«${file.name}»** готов: ${result.rendered_pages} стр. из ${result.total_pages}. Задай вопрос — ИИ увидит каждую страницу как изображение.`,
+        text: `PDF **«${file.name}»** готов: ${result.rendered_pages ?? pageCount} стр. из ${pageCount}. Задай вопрос — ИИ увидит каждую страницу как изображение.`,
         ts: getTime(), refs: [file.name],
       }]);
     } catch (e) {
@@ -3631,13 +3632,14 @@ export default function Index() {
                                             body: JSON.stringify({ action: "pdf_to_images", s3_key, dpi: 120, max_pages: 300 }),
                                             signal: abort.signal,
                                           });
-                                          const result = await resp.json() as { page_urls: string[]; total_pages: number; error?: string };
+                                          const result = await resp.json() as { page_urls: string[]; total_pages: number; rendered_pages?: number; error?: string };
                                           if (result.error) throw new Error(result.error);
+                                          const pageCount = result.total_pages ?? result.rendered_pages ?? result.page_urls?.length ?? 0;
                                           setKbLoadingProgress({ step: "Готово!", pct: 100 });
                                           const updated = knowledge.map(kk => kk.id === k.id ? {
                                             ...kk, sourceType: "pdf" as KnowledgeSourceType, enabled: true,
-                                            content: `PDF «${file.name}»: ${result.total_pages} стр.`,
-                                            fileName: file.name, pageImageUrls: result.page_urls, pageCount: result.total_pages, updatedAt: Date.now(),
+                                            content: `PDF «${file.name}»: ${pageCount} стр.`,
+                                            fileName: file.name, pageImageUrls: result.page_urls, pageCount, updatedAt: Date.now(),
                                           } : kk);
                                           setKnowledge(updated); await saveKnowledge(updated);
                                         } catch (err) {
