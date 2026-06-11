@@ -1174,9 +1174,12 @@ async function callAi(
     .filter(Boolean).join("\n\n---\n\n");
 
   const hasFiles = fullContext.trim().length > 0;
-  const textBlock = `${hasFiles ? `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\n` : "ФАЙЛЫ НЕ ЗАГРУЖЕНЫ. Отвечай как обычный ИИ-ассистент — можешь общаться, отвечать на вопросы, помогать. Не требуй файлы если пользователь просто разговаривает.\n\n"}ЗАДАНИЕ: ${prompt || "(см. изображения)"}
+  // PDF из базы знаний тоже считаются как загруженные данные (идут как изображения)
+  const kbHasPdf = knowledgeEntries.some(e => e.enabled && e.sourceType === "pdf" && e.pageImageUrls?.length);
+  const hasAnyData = hasFiles || kbHasPdf || images.length > 0;
+  const textBlock = `${hasAnyData ? `${hasFiles ? `ДАННЫЕ ФАЙЛОВ:\n${fullContext}\n\n` : ""}` : "ФАЙЛЫ НЕ ЗАГРУЖЕНЫ. Отвечай как обычный ИИ-ассистент — можешь общаться, отвечать на вопросы, помогать. Не требуй файлы если пользователь просто разговаривает.\n\n"}ЗАДАНИЕ: ${prompt || "(см. изображения)"}
 
-${hasFiles ? `КРИТИЧЕСКИЕ ПРАВИЛА ПО РАБОТЕ С ЦИФРАМИ:
+${hasAnyData ? `КРИТИЧЕСКИЕ ПРАВИЛА ПО РАБОТЕ С ЦИФРАМИ:
 1. Используй ТОЛЬКО цифры из предоставленных данных выше. НИКОГДА не придумывай и не округляй значения.
 2. Перед каждой цифрой в тексте мысленно проверь: "Эта цифра есть в данных?" Если не уверен — не пиши её, напиши "данные не предоставлены".
 3. Сравнивая проект и факт: всегда указывай оба значения (проект и факт) с единицами измерения.
@@ -1193,12 +1196,7 @@ ${hasFiles ? `КРИТИЧЕСКИЕ ПРАВИЛА ПО РАБОТЕ С ЦИФ�
   for (const url of pdfImageUrls) {
     allImageParts.push({ type: "image_url", image_url: { url } });
   }
-  // PDF из базы знаний
-  for (const kbPdf of getKnowledgePdfImages(knowledgeEntries)) {
-    for (const url of kbPdf.urls) {
-      allImageParts.push({ type: "image_url", image_url: { url } });
-    }
-  }
+  // PDF из базы знаний — добавим после вычисления kbPdfImages (см. ниже)
 
   let userContent: string | ContentPart[];
   if (allImageParts.length > 0) {
@@ -1214,8 +1212,16 @@ ${hasFiles ? `КРИТИЧЕСКИЕ ПРАВИЛА ПО РАБОТЕ С ЦИФ�
     historyMessages.push({ role: m.role === "ai" ? "assistant" : "user", content: m.text });
   }
 
-  // Если есть PDF-картинки — форсируем vision-модель
-  const hasPdfImages = pdfImageUrls.length > 0;
+  // PDF из базы знаний — добавляем в images
+  const kbPdfImages = getKnowledgePdfImages(knowledgeEntries);
+  for (const kbPdf of kbPdfImages) {
+    for (const url of kbPdf.urls) {
+      allImageParts.push({ type: "image_url", image_url: { url } });
+    }
+  }
+
+  // Если есть PDF-картинки (из документов или из базы знаний) — форсируем vision-модель
+  const hasPdfImages = pdfImageUrls.length > 0 || kbPdfImages.some(k => k.urls.length > 0);
   const VISION_UNSUPPORTED_FOR_PDF = ["deepseek/deepseek-chat", "deepseek/deepseek-r1"];
   const finalModel = (hasPdfImages && VISION_UNSUPPORTED_FOR_PDF.includes(effectiveModel))
     ? "openai/gpt-4o"
