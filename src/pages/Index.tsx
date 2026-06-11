@@ -1092,6 +1092,7 @@ async function callAi(
   valueMutations?: CellValueMutation[];
   docUpdates?: { docId: string; docName: string; text: string }[];
 }> {
+  console.log("[callAi] knowledgeEntries count:", knowledgeEntries.length, knowledgeEntries.map(e => ({ id: e.id, title: e.title, enabled: e.enabled, sourceType: e.sourceType, pagesCount: e.pageImageUrls?.length })));
   const selectedModel = settings.model === "__custom__" ? settings.customModel : settings.model;
   // Модели без поддержки vision — при наличии картинок автоматически переключаем на gpt-4o-mini
   const VISION_UNSUPPORTED = ["deepseek/deepseek-chat", "deepseek/deepseek-r1"];
@@ -1222,10 +1223,12 @@ ${hasAnyData ? `КРИТИЧЕСКИЕ ПРАВИЛА ПО РАБОТЕ С ЦИ�
 
   // Если есть PDF-картинки (из документов или из базы знаний) — форсируем vision-модель
   const hasPdfImages = pdfImageUrls.length > 0 || kbPdfImages.some(k => k.urls.length > 0);
+  console.log("[callAi] allImageParts:", allImageParts.length, "| pdfImageUrls:", pdfImageUrls.length, "| kbPdfImages:", kbPdfImages.map(k => ({ title: k.title, urls: k.urls.length })), "| hasPdfImages:", hasPdfImages);
   const VISION_UNSUPPORTED_FOR_PDF = ["deepseek/deepseek-chat", "deepseek/deepseek-r1"];
   const finalModel = (hasPdfImages && VISION_UNSUPPORTED_FOR_PDF.includes(effectiveModel))
     ? "openai/gpt-4o"
     : effectiveModel;
+  console.log("[callAi] effectiveModel:", effectiveModel, "→ finalModel:", finalModel);
 
   // Модели поддерживающие принудительный JSON-режим (response_format)
   // Llama и ряд других НЕ поддерживают — передавать им не нужно (вернут ошибку 400)
