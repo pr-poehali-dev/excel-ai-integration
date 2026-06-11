@@ -171,22 +171,26 @@ def handle_pdf_to_images(body: dict) -> dict:
     """
     import fitz  # PyMuPDF
     import boto3
+    import time
+    from botocore.config import Config as BotoConfig
 
-    dpi = min(int(body.get("dpi", 120)), 180)
-    max_pages = min(int(body.get("max_pages", 300)), 500)
+    dpi = min(int(body.get("dpi", 100)), 150)
+    max_pages = min(int(body.get("max_pages", 80)), 150)
+    deadline = time.time() + 110  # 110 сек — должны уложиться в таймаут функции
 
+    boto_cfg = BotoConfig(connect_timeout=10, read_timeout=20, retries={"max_attempts": 2})
     s3 = boto3.client(
         "s3",
         endpoint_url="https://bucket.poehali.dev",
         aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        config=boto_cfg,
     )
     access_key = os.environ["AWS_ACCESS_KEY_ID"]
 
     # Получаем байты PDF
     s3_key = body.get("s3_key", "")
     if s3_key:
-        # Читаем из S3 — работает для файлов любого размера
         obj = s3.get_object(Bucket="files", Key=s3_key)
         pdf_bytes = obj["Body"].read()
     else:
@@ -204,6 +208,8 @@ def handle_pdf_to_images(body: dict) -> dict:
     page_urls = []
 
     for page_num in range(pages_to_render):
+        if time.time() > deadline:
+            break  # Не укладываемся — возвращаем что успели
         page = doc[page_num]
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         img_bytes = pix.tobytes("png")
@@ -211,10 +217,11 @@ def handle_pdf_to_images(body: dict) -> dict:
         s3.put_object(Bucket="files", Key=key, Body=img_bytes, ContentType="image/png")
         url = f"https://cdn.poehali.dev/projects/{access_key}/bucket/{key}"
         page_urls.append(url)
+        pix = None  # Освобождаем память
 
     doc.close()
 
-    # Удаляем исходный загруженный файл из S3 (он больше не нужен)
+    # Удаляем исходный загруженный файл из S3
     if s3_key:
         try:
             s3.delete_object(Bucket="files", Key=s3_key)
@@ -227,7 +234,7 @@ def handle_pdf_to_images(body: dict) -> dict:
         "body": json.dumps({
             "page_urls": page_urls,
             "total_pages": total_pages,
-            "rendered_pages": pages_to_render,
+            "rendered_pages": len(page_urls),
             "session_id": session_id,
         }),
     }

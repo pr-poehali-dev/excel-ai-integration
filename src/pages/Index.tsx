@@ -1018,6 +1018,19 @@ bgColor AARRGGBB: жёлтый=FFFFFF00, оранжевый=FFFFA500, зелён
 type CellStyleChange = { row: number; col: number; row_text?: string; bgColor?: string; fontColor?: string; bold?: boolean };
 type CellStyleMutation = { fileId: string; sheetName: string; changes: CellStyleChange[] };
 
+function CopyMsgButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={() => { navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
+      className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-primary transition-colors px-1.5 py-0.5 rounded hover:bg-primary/10"
+      title={copied ? "Скопировано!" : "Копировать"}>
+      <Icon name={copied ? "Check" : "Copy"} size={10} />
+      {copied ? "Скопировано" : "Копировать"}
+    </button>
+  );
+}
+
 function DocTextBlock({ text, name }: { text: string; name?: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -1966,10 +1979,13 @@ export default function Index() {
       if (signal.aborted) throw new Error("Отменено");
       const chunk = file.slice(i * CHUNK, (i + 1) * CHUNK);
       const buf = await chunk.arrayBuffer();
-      // Быстрый btoa через Uint8Array
+      // Быстрый btoa — через chunks чтобы не падать на больших буферах
       const bytes = new Uint8Array(buf);
+      const BTOA_CHUNK = 8192;
       let binary = "";
-      for (let b = 0; b < bytes.length; b++) binary += String.fromCharCode(bytes[b]);
+      for (let b = 0; b < bytes.length; b += BTOA_CHUNK) {
+        binary += String.fromCharCode(...bytes.subarray(b, b + BTOA_CHUNK));
+      }
       const chunk_b64 = btoa(binary);
 
       const pct = Math.round(5 + ((i + 1) / totalChunks) * 70);
@@ -3095,7 +3111,10 @@ export default function Index() {
                         </ResponsiveContainer>
                       </div>
                     )}
-                    <p className={`text-[10px] mt-1 ${msg.role === "ai" ? "text-muted-foreground" : "opacity-50"}`}>{msg.ts}</p>
+                    <div className={`flex items-center mt-1 ${msg.role === "ai" ? "justify-between" : "justify-end"}`}>
+                      <p className={`text-[10px] ${msg.role === "ai" ? "text-muted-foreground" : "opacity-50"}`}>{msg.ts}</p>
+                      {msg.role === "ai" && <CopyMsgButton text={msg.text} />}
+                    </div>
                   </div>
                 </div>
               ))}
@@ -3653,7 +3672,14 @@ export default function Index() {
                                   {kbLoadingProgress.step}
                                 </span>
                                 <button
-                                  onClick={() => { kbAbortRef.current?.abort(); }}
+                                  onClick={() => {
+                                    kbAbortRef.current?.abort();
+                                    kbAbortRef.current = null;
+                                    setKbLoadingId(null);
+                                    setKbLoadingProgress(null);
+                                    // Удаляем placeholder запись которая не загрузилась
+                                    setKnowledge(prev => prev.filter(kk => kk.id !== k.id));
+                                  }}
                                   className="text-[10px] text-red-400 hover:text-red-300 flex items-center gap-1 px-1.5 py-0.5 rounded border border-red-400/30 hover:border-red-400/60 transition-all">
                                   <Icon name="X" size={9} /> Отменить
                                 </button>
@@ -3731,6 +3757,12 @@ export default function Index() {
                             </button>
                           )}
                           <button onClick={async () => {
+                            if (kbLoadingId === k.id) {
+                              kbAbortRef.current?.abort();
+                              kbAbortRef.current = null;
+                              setKbLoadingId(null);
+                              setKbLoadingProgress(null);
+                            }
                             const updated = knowledge.filter(kk => kk.id !== k.id);
                             setKnowledge(updated); await saveKnowledge(updated);
                           }} className="w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-red-400 hover:bg-red-400/10 transition-all"
